@@ -1,5 +1,4 @@
 
-> **Fork notice:** this project is a fork of [decolua/9remote](https://github.com/decolua/9remote) (Apache-2.0). Original copyright and license notices are kept in LICENSE.
 # f3mote — Remote Everything, Vibecode Everywhere
 
 Your entire dev workstation in your pocket. A remote IDE, 60fps desktop stream, visual file explorer, live mobile emulator, zero-config localhost preview, and every AI harness in one UI — Claude Code, Codex, Gemini CLI & 30+ agents — on PC, Web, iPad, or phone.
@@ -145,3 +144,7 @@ The host itself runs anywhere Node runs — no Cloudflare dependency.
 ## 📄 License
 
 Apache License 2.0 — see [LICENSE](LICENSE). Free to use, modify, and distribute, including commercially. The "f3mote" name and branding are not covered by the license.
+
+## License
+
+This project is derived from [decolua/9remote](https://github.com/decolua/9remote) under the Apache-2.0 license. The original copyright and license notices are retained in [LICENSE](./LICENSE).
