@@ -1,0 +1,43 @@
+name: Release f3mote
+
+on:
+  push:
+    tags:
+      - "host-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # npm trusted publishing (OIDC) and provenance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Check tag matches package version
+        if: startsWith(github.ref, 'refs/tags/host-v')
+        run: |
+          TAG="${GITHUB_REF_NAME#host-v}"
+          PKG=$(node -p "require('./host/package.json').version")
+          if [ "$TAG" != "$PKG" ]; then
+            echo "Tag host-v$TAG does not match host/package.json version $PKG" >&2
+            exit 1
+          fi
+
+      - name: Install and build
+        run: |
+          npm install --no-audit --no-fund
+          npm run host:build
+
+      - name: Publish to npm
+        working-directory: host
+        run: npm publish --provenance --access public
