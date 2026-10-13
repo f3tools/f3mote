@@ -1,0 +1,1645 @@
+use tauri::{
+    AppHandle, Emitter, Manager,
+    image::Image,
+    menu::{IconMenuItem, Menu, MenuItem, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+};
+
+const SERVER_PORT: u16 = 2208;
+const VITE_PORT: u16 = 5173;
+const NPM_PREFIX_DIR: &str = ".f3mote/npm";
+const NODE_CACHE_DIR: &str = ".f3mote/node";
+const NPM_PACKAGE: &str = "f3mote";
+// Local install (`npm install --prefix`, no -g) lands in <prefix>/node_modules on every OS
+const CLI_REL_PATH: &str = "node_modules/f3mote/dist/cli.cjs";
+const HEALTH_TIMEOUT_SECS: u64 = 60;
+const HEALTH_POLL_MS: u64 = 200;
+const NPM_INSTALL_TIMEOUT_SECS: u64 = 300;
+const NODE_DOWNLOAD_URL: &str = "https://nodejs.org/en/download";
+// N-API 10 lands in v22.14 — @julusian/jpeg-turbo@3 is built against it and segfaults
+// (not a catchable throw) on anything older, so an older Node counts as no Node at all.
+const MIN_NODE: (u32, u32) = (22, 14);
+// Pinned: the app must never swap the runtime under a running host. Node 24 is the
+// active LTS, so one download lasts until 2028.
+const NODE_LTS_VERSION: &str = "v24.19.0";
+const NODE_DIST_BASE: &str = "https://nodejs.org/dist";
+// Fallback sources when nodejs.org / npmjs.org are unreachable
+const NODE_MIRROR_DIST_BASE: &str = "https://registry.npmmirror.com/-/binary/node";
+const NPM_MIRROR_REGISTRY: &str = "https://registry.npmmirror.com";
+const NODE_DOWNLOAD_TIMEOUT_SECS: u64 = 600;
+// Two shots per source: transient AV file locks and flaky links usually clear on retry
+const NODE_DOWNLOAD_ATTEMPTS: u32 = 2;
+const SETUP_LOG_FILE: &str = ".f3mote/setup.log";
+// Keep spawned children from allocating a console window in this GUI-subsystem app
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+// Track full PID chain for clean shutdown
+static AGENT_PID: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Option<u32>>>> =
+    std::sync::OnceLock::new();
+
+// Host stdout/stderr captured while starting, replayed into the GUI on failure —
+// a GUI-subsystem binary has no stderr on Windows, so without this the splash can
+// only say "did not start" with no clue why (github.com/f3tools/f3mote/issues/21)
+static HOST_LOG: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<String>>>> =
+    std::sync::OnceLock::new();
+// true until the server answers health — bounds host chatter written to setup.log
+static HOST_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+const HOST_LOG_MAX: usize = 120;
+
+fn push_host_log(line: &str) {
+    if let Ok(mut log) = HOST_LOG.get_or_init(Default::default).lock() {
+        log.push(line.to_string());
+        let excess = log.len().saturating_sub(HOST_LOG_MAX);
+        log.drain(0..excess);
+    }
+}
+
+fn host_log_tail(n: usize) -> String {
+    if let Ok(log) = HOST_LOG.get_or_init(Default::default).lock() {
+        return log.iter().skip(log.len().saturating_sub(n)).cloned().collect::<Vec<_>>().join("\n");
+    }
+    String::new()
+}
+
+fn get_agent_pid() -> &'static std::sync::Arc<std::sync::Mutex<Option<u32>>> {
+    AGENT_PID.get_or_init(|| std::sync::Arc::new(std::sync::Mutex::new(None)))
+}
+
+// TERM the host. `group` targets the whole process group — our own spawn is a
+// session leader, so its children die with it. The respawned (post-update)
+// host is not a group leader; plain TERM is enough there because its exit
+// handler tears down server/tunnel itself.
+fn kill_agent(pid: u32, group: bool) {
+    #[cfg(unix)]
+    {
+        let target = if group { format!("-{pid}") } else { pid.to_string() };
+        let _ = std::process::Command::new("kill")
+            .args(["-TERM", &target])
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .creation_flags(CREATE_NO_WINDOW)
+            .status();
+    }
+    let _ = group; // unused on windows — taskkill /T always covers the tree
+}
+
+fn agent_pid_file() -> String {
+    format!("{}/.f3mote/pids/agent.pid", home_dir())
+}
+
+// Guard against PID reuse: only kill when the PID still names a f3mote process.
+fn is_f3mote_process(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .output();
+        out.map(|o| String::from_utf8_lossy(&o.stdout).contains("f3mote"))
+            .unwrap_or(false)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let query = format!("(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine");
+        let out = std::process::Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", &query])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        out.map(|o| String::from_utf8_lossy(&o.stdout).contains("f3mote"))
+            .unwrap_or(false)
+    }
+}
+
+// Kill host process group so server.cjs + cloudflared children don't leak.
+// After a remote self-update the host respawns itself, so our stored PID goes
+// stale — the respawn publishes its own PID in ~/.f3mote/pids/agent.pid.
+fn kill_agent_tree() {
+    let spawned = match get_agent_pid().lock() {
+        Ok(mut g) => g.take(),
+        Err(_) => None,
+    };
+    if let Some(pid) = spawned {
+        eprintln!("[Desktop] Killing agent tree PID: {pid}");
+        kill_agent(pid, true);
+    }
+    if let Ok(text) = std::fs::read_to_string(agent_pid_file()) {
+        if let Ok(pid) = text.trim().parse::<u32>() {
+            if Some(pid) != spawned && is_f3mote_process(pid) {
+                eprintln!("[Desktop] Killing respawned agent PID: {pid}");
+                kill_agent(pid, false);
+            }
+        }
+    }
+}
+
+// ── Permission structs ──────────────────────────────────────────────────────
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct PermissionStatus {
+    screen_recording: bool,
+    accessibility: bool,
+}
+
+#[tauri::command]
+fn check_permissions() -> PermissionStatus {
+    #[cfg(target_os = "macos")]
+    {
+        PermissionStatus {
+            screen_recording: check_screen_recording(),
+            accessibility: check_accessibility(),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        PermissionStatus { screen_recording: true, accessibility: true }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn check_screen_recording() -> bool {
+    let script = "import CoreGraphics\nlet list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as? [[String: Any]] ?? []\nlet hasName = list.contains { ($0[\"kCGWindowOwnerName\"] as? String) != nil }\nprint(hasName ? \"1\" : \"0\")";
+    run_swift(script).trim() == "1"
+}
+
+#[cfg(target_os = "macos")]
+fn check_accessibility() -> bool {
+    let script = "import ApplicationServices\nprint(AXIsProcessTrusted() ? \"1\" : \"0\")";
+    run_swift(script).trim() == "1"
+}
+
+#[cfg(target_os = "macos")]
+fn run_swift(script: &str) -> String {
+    use std::io::Write;
+    let result = std::process::Command::new("swift")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .and_then(|mut child| {
+            if let Some(stdin) = child.stdin.as_mut() {
+                let _ = stdin.write_all(script.as_bytes());
+            }
+            child.wait_with_output()
+        });
+    match result {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "AppKit", kind = "framework")]
+#[link(name = "objc")]
+extern "C" {
+    fn objc_getClass(name: *const u8) -> *mut std::ffi::c_void;
+    fn sel_registerName(name: *const u8) -> *mut std::ffi::c_void;
+    fn objc_msgSend();
+}
+
+#[cfg(target_os = "macos")]
+fn center_window_title(ns_window: *mut std::ffi::c_void) {
+    if ns_window.is_null() { return; }
+    unsafe {
+        let ns_color_class = objc_getClass(b"NSColor\0".as_ptr());
+
+        // 1. Force Dark Aqua appearance on macOS window
+        let ns_appearance_class = objc_getClass(b"NSAppearance\0".as_ptr());
+        let ns_string_class = objc_getClass(b"NSString\0".as_ptr());
+        let sel_str = sel_registerName(b"stringWithUTF8String:\0".as_ptr());
+        let dark_aqua_str: *mut std::ffi::c_void = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *const u8) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(ns_string_class, sel_str, b"NSAppearanceNameDarkAqua\0".as_ptr())
+        };
+        if !dark_aqua_str.is_null() {
+            let sel_appearance_named = sel_registerName(b"appearanceNamed:\0".as_ptr());
+            let dark_appearance: *mut std::ffi::c_void = {
+                let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+                msg_send(ns_appearance_class, sel_appearance_named, dark_aqua_str)
+            };
+            if !dark_appearance.is_null() {
+                let sel_set_appearance = sel_registerName(b"setAppearance:\0".as_ptr());
+                let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) = std::mem::transmute(objc_msgSend as *const ());
+                msg_send(ns_window, sel_set_appearance, dark_appearance);
+            }
+        }
+
+        // 2. Set titlebar transparent & window background color to #2a2a2a (matches left/right panels)
+        let sel_set_titlebar_transparent = sel_registerName(b"setTitlebarAppearsTransparent:\0".as_ptr());
+        {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, bool) = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(ns_window, sel_set_titlebar_transparent, true);
+        }
+
+        let sel_color_rgba = sel_registerName(b"colorWithRed:green:blue:alpha:\0".as_ptr());
+        let bg_color: *mut std::ffi::c_void = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, f64, f64, f64, f64) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(ns_color_class, sel_color_rgba, 42.0 / 255.0, 42.0 / 255.0, 42.0 / 255.0, 1.0)
+        };
+        if !bg_color.is_null() {
+            let sel_set_bg_color = sel_registerName(b"setBackgroundColor:\0".as_ptr());
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(ns_window, sel_set_bg_color, bg_color);
+        }
+
+        let sel_btn = sel_registerName(b"standardWindowButton:\0".as_ptr());
+        let close_btn: *mut std::ffi::c_void = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, usize) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(ns_window, sel_btn, 0)
+        };
+        if close_btn.is_null() { return; }
+
+        let sel_superview = sel_registerName(b"superview\0".as_ptr());
+        let titlebar: *mut std::ffi::c_void = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(close_btn, sel_superview)
+        };
+        if titlebar.is_null() { return; }
+
+        // Paint titlebar & its container layer with the exact #2a2a2a background color
+        let sel_cg_color = sel_registerName(b"CGColor\0".as_ptr());
+        let cg_bg: *mut std::ffi::c_void = if !bg_color.is_null() {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(bg_color, sel_cg_color)
+        } else {
+            std::ptr::null_mut()
+        };
+
+        if !cg_bg.is_null() {
+            let sel_set_wants_layer = sel_registerName(b"setWantsLayer:\0".as_ptr());
+            let sel_layer = sel_registerName(b"layer\0".as_ptr());
+            let sel_set_layer_bg = sel_registerName(b"setBackgroundColor:\0".as_ptr());
+
+            let msg_send_bool: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, bool) = std::mem::transmute(objc_msgSend as *const ());
+            let msg_send_layer: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            let msg_send_set_bg: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) = std::mem::transmute(objc_msgSend as *const ());
+
+            msg_send_bool(titlebar, sel_set_wants_layer, true);
+            let tb_layer = msg_send_layer(titlebar, sel_layer);
+            if !tb_layer.is_null() {
+                msg_send_set_bg(tb_layer, sel_set_layer_bg, cg_bg);
+            }
+
+            let titlebar_container: *mut std::ffi::c_void = {
+                let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+                msg_send(titlebar, sel_superview)
+            };
+            if !titlebar_container.is_null() {
+                msg_send_bool(titlebar_container, sel_set_wants_layer, true);
+                let tc_layer = msg_send_layer(titlebar_container, sel_layer);
+                if !tc_layer.is_null() {
+                    msg_send_set_bg(tc_layer, sel_set_layer_bg, cg_bg);
+                }
+            }
+        }
+
+        let sel_subviews = sel_registerName(b"subviews\0".as_ptr());
+        let subviews: *mut std::ffi::c_void = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(titlebar, sel_subviews)
+        };
+        if subviews.is_null() { return; }
+
+        let sel_count = sel_registerName(b"count\0".as_ptr());
+        let count: usize = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> usize = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(subviews, sel_count)
+        };
+
+        let sel_object_at = sel_registerName(b"objectAtIndex:\0".as_ptr());
+        let text_field_class = objc_getClass(b"NSTextField\0".as_ptr());
+        let sel_is_kind_of = sel_registerName(b"isKindOfClass:\0".as_ptr());
+
+        let mut target_tf: *mut std::ffi::c_void = std::ptr::null_mut();
+        for i in 0..count {
+            let view: *mut std::ffi::c_void = {
+                let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, usize) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+                msg_send(subviews, sel_object_at, i)
+            };
+            let is_tf: bool = {
+                let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) -> bool = std::mem::transmute(objc_msgSend as *const ());
+                msg_send(view, sel_is_kind_of, text_field_class)
+            };
+            if is_tf {
+                target_tf = view;
+                break;
+            }
+        }
+
+        if target_tf.is_null() { return; }
+
+        let sel_translates = sel_registerName(b"translatesAutoresizingMaskIntoConstraints\0".as_ptr());
+        let translates: bool = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> bool = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(target_tf, sel_translates)
+        };
+        if !translates { return; }
+
+        let sel_set_translates = sel_registerName(b"setTranslatesAutoresizingMaskIntoConstraints:\0".as_ptr());
+        {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, bool) = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(target_tf, sel_set_translates, false);
+        }
+
+        let sel_set_alignment = sel_registerName(b"setAlignment:\0".as_ptr());
+        {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, isize) = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(target_tf, sel_set_alignment, 1);
+        }
+
+        // Set title text color to pure white in dark theme
+        let sel_white_color = sel_registerName(b"whiteColor\0".as_ptr());
+        let white_color: *mut std::ffi::c_void = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(ns_color_class, sel_white_color)
+        };
+        if !white_color.is_null() {
+            let sel_set_text_color = sel_registerName(b"setTextColor:\0".as_ptr());
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(target_tf, sel_set_text_color, white_color);
+        }
+
+        let sel_center_x = sel_registerName(b"centerXAnchor\0".as_ptr());
+        let sel_constraint_eq = sel_registerName(b"constraintEqualToAnchor:\0".as_ptr());
+        let tf_center_x: *mut std::ffi::c_void = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(target_tf, sel_center_x)
+        };
+        let tb_center_x: *mut std::ffi::c_void = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(titlebar, sel_center_x)
+        };
+        let c1: *mut std::ffi::c_void = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(tf_center_x, sel_constraint_eq, tb_center_x)
+        };
+
+        let sel_center_y = sel_registerName(b"centerYAnchor\0".as_ptr());
+        let tf_center_y: *mut std::ffi::c_void = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(target_tf, sel_center_y)
+        };
+        let tb_center_y: *mut std::ffi::c_void = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(titlebar, sel_center_y)
+        };
+        let c2: *mut std::ffi::c_void = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(tf_center_y, sel_constraint_eq, tb_center_y)
+        };
+
+        let ns_layout_constraint_class = objc_getClass(b"NSLayoutConstraint\0".as_ptr());
+        let ns_array_class = objc_getClass(b"NSArray\0".as_ptr());
+        let sel_array_with_objects = sel_registerName(b"arrayWithObjects:count:\0".as_ptr());
+        let constraints = [c1, c2];
+        let arr: *mut std::ffi::c_void = {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *const *mut std::ffi::c_void, usize) -> *mut std::ffi::c_void = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(ns_array_class, sel_array_with_objects, constraints.as_ptr(), 2)
+        };
+        let sel_activate = sel_registerName(b"activateConstraints:\0".as_ptr());
+        {
+            let msg_send: unsafe extern "C" fn(*mut std::ffi::c_void, *mut std::ffi::c_void, *mut std::ffi::c_void) = std::mem::transmute(objc_msgSend as *const ());
+            msg_send(ns_layout_constraint_class, sel_activate, arr);
+        }
+    }
+}
+
+#[tauri::command]
+fn request_permission(#[allow(unused_variables)] permission_type: String) {
+    #[cfg(target_os = "macos")]
+    {
+        match permission_type.as_str() {
+            "screenRecording" => {
+                let script = "import CoreGraphics\nCGRequestScreenCaptureAccess()";
+                let _ = run_swift(script);
+                let _ = std::process::Command::new("open")
+                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+                    .spawn();
+            }
+            "accessibility" => {
+                let script = "import ApplicationServices\nlet opts = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary\nAXIsProcessTrustedWithOptions(opts)";
+                let _ = run_swift(script);
+                let _ = std::process::Command::new("open")
+                    .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+                    .spawn();
+            }
+            _ => {}
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "ms-settings:privacy-screencapture"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+    }
+}
+
+#[tauri::command]
+fn quit_app(app: AppHandle) {
+    app.exit(0);
+}
+
+// macOS dock badge / Windows taskbar overlay. count <= 0 clears it.
+// Platforms without badge support (most Linux DEs) return an error → JS ignores.
+#[tauri::command]
+fn set_badge(app: AppHandle, count: i64) -> Result<(), String> {
+    let value = if count > 0 { Some(count) } else { None };
+    match app.get_webview_window("main") {
+        Some(win) => win.set_badge_count(value).map_err(|e| e.to_string()),
+        None => Err("main window not found".into()),
+    }
+}
+
+// Local OS notification banner. Rust-side so JS doesn't need plugin ACL.
+#[tauri::command]
+fn show_notif(app: AppHandle, title: String, body: String) -> Result<(), String> {
+    use tauri_plugin_notification::NotificationExt;
+    app.notification()
+        .builder()
+        .title(title)
+        .body(body)
+        .show()
+        .map_err(|e| e.to_string())
+}
+
+// Opens http(s) links in the user's default browser. The host UI calls this for
+// target="_blank" / window.open — Tauri's webview swallows those without it.
+#[tauri::command]
+fn open_external(app: AppHandle, url: String) -> Result<(), String> {
+    let parsed = url::Url::parse(&url).map_err(|_| format!("Invalid URL: {url}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(format!("Refused non-http(s) URL: {url}"));
+    }
+    use tauri_plugin_opener::OpenerExt;
+    app.opener()
+        .open_url(parsed.as_str(), None::<&str>)
+        .map_err(|e| e.to_string())
+}
+
+// ── Path helpers ────────────────────────────────────────────────────────────
+
+fn home_dir() -> String {
+    std::env::var("HOME").unwrap_or_else(|_| std::env::var("USERPROFILE").unwrap_or_default())
+}
+
+// Children resolve bare `node` via PATH. A Finder-launched GUI only inherits
+// /usr/bin:/bin:/usr/sbin:/sbin, so nvm/fnm/volta installs are invisible and the child
+// fails: ENOENT from a direct spawn, exit 127 from koffi's `sh -c node ...`. Put our
+// resolved node dir first; the extra bins are copied verbatim from the inline
+// server-spawn block, keeping both PATHs byte-identical. The host's own superset
+// (host/features/ai/adapters/env.js) reaches only its AI tool spawns, never this child.
+fn apply_node_path(cmd: &mut std::process::Command, node: &str) {
+    if let Some(dir) = std::path::Path::new(node).parent() {
+        let existing = std::env::var("PATH").unwrap_or_default();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        #[cfg(unix)]
+        {
+            let home = home_dir();
+            let extra = format!(
+                "{sep}{}/.local/bin{sep}/opt/homebrew/bin{sep}/usr/local/bin{sep}{}/.cargo/bin{sep}{}/.bun/bin",
+                home, home, home
+            );
+            cmd.env("PATH", format!("{}{sep}{existing}{extra}", dir.display()));
+        }
+        #[cfg(not(unix))]
+        cmd.env("PATH", format!("{}{sep}{existing}", dir.display()));
+    }
+}
+
+// Setup trail: a GUI-subsystem binary has no visible stderr on Windows, so every
+// setup decision also lands in ~/.f3mote/setup.log for support to read back
+fn note(msg: &str) {
+    eprintln!("[Desktop] {msg}");
+    let file = std::path::PathBuf::from(home_dir()).join(SETUP_LOG_FILE);
+    let _ = std::fs::create_dir_all(file.parent().unwrap_or(std::path::Path::new("")));
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&file) else { return };
+    use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = f.write_all(format!("[{ts}] {msg}\n").as_bytes());
+}
+
+// Agent honoring HTTP(S)_PROXY/ALL_PROXY env — corporate egress otherwise blackholes the download
+fn http_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new().build()
+}
+
+fn npm_prefix() -> String {
+    format!("{}/{}", home_dir(), NPM_PREFIX_DIR)
+}
+
+// Global `npm i -g f3mote` install, if the user already has one.
+// Reusing it avoids a redundant 270-package install into our private prefix.
+fn global_cli_path() -> Option<String> {
+    // Volta is omitted: its package images nest under an extra <version> segment,
+    // so there is no fixed path to probe. Those users fall back to the private prefix.
+    #[cfg(windows)]
+    let mut roots = {
+        let env = |k: &str| std::env::var(k).unwrap_or_default();
+        vec![
+            format!("{}\\npm\\node_modules", env("APPDATA")),
+            format!("{}\\nodejs\\node_modules", env("ProgramFiles")),
+        ]
+    };
+    // Windows npm puts globals next to node itself: <dir>\node.exe → <dir>\node_modules
+    #[cfg(windows)]
+    {
+        let node = find_node_binary();
+        if let Some(dir) = std::path::Path::new(&node).parent() {
+            roots.insert(0, dir.join("node_modules").to_string_lossy().to_string());
+        }
+    }
+
+    #[cfg(not(windows))]
+    let mut roots = vec![
+        "/usr/local/lib/node_modules".to_string(),
+        "/opt/homebrew/lib/node_modules".to_string(),
+        format!("{}/.volta/tools/image/packages/{NPM_PACKAGE}/lib/node_modules", home_dir()),
+    ];
+    // Version-manager installs live next to the node binary: <prefix>/bin/node → <prefix>/lib/node_modules
+    #[cfg(not(windows))]
+    {
+        let node = find_node_binary();
+        if let Some(prefix) = std::path::Path::new(&node).parent().and_then(|p| p.parent()) {
+            roots.insert(0, prefix.join("lib/node_modules").to_string_lossy().to_string());
+        }
+    }
+    roots.into_iter().find_map(|root| {
+        let cli = format!("{root}/{NPM_PACKAGE}/dist/cli.cjs");
+        std::path::Path::new(&cli).exists().then_some(cli)
+    })
+}
+
+// Private prefix wins when present (we control its version); otherwise reuse a global install.
+fn cli_path() -> String {
+    let private = format!("{}/{}", npm_prefix(), CLI_REL_PATH);
+    if std::path::Path::new(&private).exists() { return private; }
+    global_cli_path().unwrap_or(private)
+}
+
+// Parse "v22.22.0" / "22.22" into comparable numeric tuple
+fn parse_version(name: &str) -> (u32, u32, u32) {
+    let mut parts = name.trim_start_matches('v').split('.');
+    let mut next = || parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    (next(), next(), next())
+}
+
+// Highest-versioned node under a version-manager dir, optionally filtered by prefix
+fn newest_node_in(dir: &str, prefix: Option<&str>) -> Option<String> {
+    let mut best: Option<((u32, u32, u32), String)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(p) = prefix {
+            let stripped = name.trim_start_matches('v');
+            if stripped != p && !stripped.starts_with(&format!("{p}.")) { continue; }
+        }
+        // nvm-windows puts node.exe at the version root; fnm nests it under installation/
+        #[cfg(windows)]
+        let rels = ["node.exe", "installation/node.exe"];
+        #[cfg(not(windows))]
+        let rels = ["bin/node"];
+        let Some(node) = rels.iter().map(|r| entry.path().join(r)).find(|p| p.exists()) else { continue };
+        let version = parse_version(&name);
+        if best.as_ref().is_none_or(|(b, _)| version > *b) {
+            best = Some((version, node.to_string_lossy().to_string()));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+#[cfg(windows)]
+fn find_system_node() -> String {
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+
+    // nvm-windows keeps the active version symlinked here — respect the user's `nvm use`
+    let symlink = env("NVM_SYMLINK");
+    if !symlink.is_empty() {
+        let node = format!("{symlink}\\node.exe");
+        if std::path::Path::new(&node).exists() { return node; }
+    }
+
+    // nvm-windows root: <NVM_HOME>\vX.Y.Z\node.exe
+    let nvm_home = env("NVM_HOME");
+    if !nvm_home.is_empty() {
+        if let Some(node) = newest_node_in(&nvm_home, None) { return node; }
+    }
+
+    // fnm: <FNM_DIR|%APPDATA%\fnm|%LOCALAPPDATA%\fnm>\node-versions\vX.Y.Z\installation\node.exe
+    let fnm_dir = env("FNM_DIR");
+    let fnm_roots = if fnm_dir.is_empty() {
+        vec![format!("{}\\fnm", env("APPDATA")), format!("{}\\fnm", env("LOCALAPPDATA"))]
+    } else {
+        vec![fnm_dir]
+    };
+    for root in fnm_roots {
+        if let Some(node) = newest_node_in(&format!("{root}\\node-versions"), None) { return node; }
+    }
+
+    // Volta: resolve the real node, not %VOLTA_HOME%\bin\node.exe — that is a shim with
+    // no npm beside it. Windows images have node.exe at the image root (no bin/ subdir).
+    let volta_home = match env("VOLTA_HOME") {
+        v if !v.is_empty() => v,
+        _ => format!("{}\\Volta", env("LOCALAPPDATA")),
+    };
+    if let Some(node) = newest_node_in(&format!("{volta_home}\\tools\\image\\node"), None) {
+        return node;
+    }
+
+    for base in [env("ProgramFiles"), env("ProgramFiles(x86)"), env("LOCALAPPDATA")] {
+        if base.is_empty() { continue; }
+        let node = format!("{base}\\nodejs\\node.exe");
+        if std::path::Path::new(&node).exists() { return node; }
+    }
+
+    // Last resort: walk PATH ourselves. Shelling out to `where` would flash a console
+    // window on every call, and this runs on several code paths.
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let node = dir.join("node.exe");
+            if node.exists() { return node.to_string_lossy().to_string(); }
+        }
+    }
+    "node".to_string()
+}
+
+#[cfg(not(windows))]
+fn find_system_node() -> String {
+    let home = home_dir();
+
+    // nvm: resolve alias ("22") to the highest matching install ("v22.22.0")
+    let nvm_dir = format!("{home}/.nvm/versions/node");
+    if let Ok(alias) = std::fs::read_to_string(format!("{home}/.nvm/alias/default")) {
+        let alias = alias.trim();
+        let exact = format!("{nvm_dir}/{alias}/bin/node");
+        if std::path::Path::new(&exact).exists() { return exact; }
+        if let Some(node) = newest_node_in(&nvm_dir, Some(alias.trim_start_matches('v'))) {
+            return node;
+        }
+    }
+    if let Some(node) = newest_node_in(&nvm_dir, None) { return node; }
+
+    // Other version managers
+    for dir in [format!("{home}/.local/share/fnm/node-versions"), format!("{home}/Library/Application Support/fnm/node-versions")] {
+        if let Some(node) = newest_node_in(&dir, None) { return node; }
+    }
+    let volta = format!("{home}/.volta/bin/node");
+    if std::path::Path::new(&volta).exists() { return volta; }
+
+    let candidates = ["/opt/homebrew/bin/node", "/usr/local/bin/node", "/usr/bin/node"];
+    for path in &candidates {
+        if std::path::Path::new(path).exists() { return path.to_string(); }
+    }
+    // Homebrew versioned formulae (node@22, node@20, ...)
+    for cellar in ["/opt/homebrew/opt", "/usr/local/opt"] {
+        if let Ok(entries) = std::fs::read_dir(cellar) {
+            let mut best: Option<((u32, u32, u32), String)> = None;
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let Some(ver) = name.strip_prefix("node@") else { continue };
+                let node = entry.path().join("bin/node");
+                if !node.exists() { continue; }
+                let version = parse_version(ver);
+                if best.as_ref().is_none_or(|(b, _)| version > *b) {
+                    best = Some((version, node.to_string_lossy().to_string()));
+                }
+            }
+            if let Some((_, path)) = best { return path; }
+        }
+    }
+    "node".to_string()
+}
+
+// Our downloaded runtime: <cache>/bin/node on unix, <cache>\node.exe on Windows
+fn cached_node_path() -> String {
+    let home = home_dir();
+    if cfg!(windows) {
+        format!("{home}/{NODE_CACHE_DIR}/node.exe")
+    } else {
+        format!("{home}/{NODE_CACHE_DIR}/bin/node")
+    }
+}
+
+// Runs `node -v` and parses "v24.19.0" into (24, 19). None when it won't execute —
+// which also catches a glibc binary unpacked onto a musl system.
+fn node_version(path: &str) -> Option<(u32, u32)> {
+    let mut cmd = std::process::Command::new(path);
+    cmd.arg("-v");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() { return None; }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (major, minor, _) = parse_version(text.trim());
+    (major > 0).then_some((major, minor))
+}
+
+fn node_is_supported(path: &str) -> bool {
+    node_version(path).is_some_and(|v| v >= MIN_NODE)
+}
+
+// Our own runtime wins — we know its version. A system Node is only used when it is
+// new enough; too old is treated as absent so ensure_node() downloads a good one.
+fn find_node_binary() -> String {
+    let cached = cached_node_path();
+    if std::path::Path::new(&cached).exists() && node_is_supported(&cached) {
+        return cached;
+    }
+    let system = find_system_node();
+    if system != "node" && node_is_supported(&system) {
+        return system;
+    }
+    "node".to_string()
+}
+
+// True when no usable Node was found — either none at all, or all of them too old
+fn node_missing() -> bool {
+    find_node_binary() == "node"
+}
+
+// ── Node runtime download ───────────────────────────────────────────────────
+
+// The <os>-<arch> slug nodejs.org publishes, or None where it ships no build:
+// linux armv7 (dropped in Node 24) and musl (official builds are glibc-only).
+fn node_platform_slug() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("darwin-arm64"),
+        ("macos", "x86_64") => Some("darwin-x64"),
+        ("windows", "x86_64") => Some("win-x64"),
+        ("windows", "aarch64") => Some("win-arm64"),
+        ("linux", "x86_64") => Some("linux-x64"),
+        ("linux", "aarch64") => Some("linux-arm64"),
+        _ => None,
+    }
+}
+
+fn node_archive_ext() -> &'static str {
+    if cfg!(windows) { "zip" } else { "tar.gz" }
+}
+
+// SHA256 of the archive, read from the release's SHASUMS256.txt on the same base
+fn fetch_expected_sha(base: &str, file_name: &str) -> Option<String> {
+    let url = format!("{base}/{NODE_LTS_VERSION}/SHASUMS256.txt");
+    let body = http_agent().get(&url).call().ok()?.into_string().ok()?;
+    body.lines().find_map(|line| {
+        let (sha, name) = line.split_once("  ")?;
+        (name.trim() == file_name).then(|| sha.to_string())
+    })
+}
+
+fn download_with_progress(url: &str, app: &AppHandle) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let resp = http_agent().get(url)
+        .timeout(std::time::Duration::from_secs(NODE_DOWNLOAD_TIMEOUT_SECS))
+        .call()
+        .map_err(|e| format!("download failed: {e}"))?;
+
+    let total: usize = resp
+        .header("content-length")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
+    let mut reader = resp.into_reader();
+    let mut buf = Vec::with_capacity(total.max(1 << 22));
+    let mut chunk = vec![0u8; 1 << 16];
+    let mut last_mb = 0;
+    loop {
+        let n = reader.read(&mut chunk).map_err(|e| format!("read failed: {e}"))?;
+        if n == 0 { break; }
+        buf.extend_from_slice(&chunk[..n]);
+        // Emit per megabyte, not per chunk — 64KB chunks would flood the UI
+        let mb = buf.len() >> 20;
+        if mb > last_mb {
+            last_mb = mb;
+            let msg = if total > 0 {
+                format!("Downloading Node.js... {} / {} MB", mb, total >> 20)
+            } else {
+                format!("Downloading Node.js... {mb} MB")
+            };
+            let _ = app.emit("setup_progress", msg);
+        }
+    }
+    Ok(buf)
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+// Archives wrap everything in a `node-v24.19.0-<slug>/` directory; strip it so the
+// layout matches what cached_node_path() expects. Rejects any path that still
+// escapes after stripping — defense-in-depth even though the archive is checksummed.
+fn strip_root(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::path::Component;
+    let mut parts = path.components();
+    parts.next()?; // drop the top-level versioned dir
+    let rest: std::path::PathBuf = parts.collect();
+    if rest.as_os_str().is_empty() { return None; }
+    // No parent-dir components, no absolute paths — keep extraction inside dest
+    rest.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir)).then_some(rest)
+}
+
+#[cfg(not(windows))]
+fn extract_archive(data: &[u8], dest: &std::path::Path) -> Result<(), String> {
+    let decoder = flate2::read::GzDecoder::new(data);
+    let mut archive = tar::Archive::new(decoder);
+    archive.set_preserve_permissions(true);
+    for entry in archive.entries().map_err(|e| format!("tar read failed: {e}"))? {
+        let mut entry = entry.map_err(|e| format!("tar entry failed: {e}"))?;
+        let path = entry.path().map_err(|e| format!("tar path failed: {e}"))?.into_owned();
+        let Some(rel) = strip_root(&path) else { continue };
+        entry
+            .unpack(dest.join(rel))
+            .map_err(|e| format!("unpack failed: {e}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn extract_archive(data: &[u8], dest: &std::path::Path) -> Result<(), String> {
+    use std::io::{Cursor, Write};
+    let mut archive =
+        zip::ZipArchive::new(Cursor::new(data)).map_err(|e| format!("zip open failed: {e}"))?;
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).map_err(|e| format!("zip entry failed: {e}"))?;
+        let Some(path) = file.enclosed_name() else { continue };
+        let Some(rel) = strip_root(&path) else { continue };
+        let out = dest.join(rel);
+        if file.is_dir() {
+            std::fs::create_dir_all(&out).map_err(|e| format!("mkdir failed: {e}"))?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {e}"))?;
+        }
+        let mut dst = std::fs::File::create(&out).map_err(|e| format!("create failed: {e}"))?;
+        std::io::copy(&mut file, &mut dst).map_err(|e| format!("write failed: {e}"))?;
+        dst.flush().ok();
+    }
+    Ok(())
+}
+
+fn download_node(app: &AppHandle) -> Result<(), String> {
+    let Some(slug) = node_platform_slug() else {
+        return Err(format!(
+            "No official Node.js build for {}-{}. Install Node {}.{}+ manually from {NODE_DOWNLOAD_URL}.",
+            std::env::consts::OS, std::env::consts::ARCH, MIN_NODE.0, MIN_NODE.1
+        ));
+    };
+
+    // Official builds are glibc-only. On musl (Alpine) the download would extract fine but
+    // fail to execute — catch it now and point at the package manager instead.
+    #[cfg(target_os = "linux")]
+    if std::fs::symlink_metadata("/lib/ld-musl-x86_64.so.1").is_ok()
+        || std::fs::symlink_metadata("/lib/ld-musl-aarch64.so.1").is_ok()
+    {
+        return Err(
+            "This is a musl-based Linux (e.g. Alpine). Install Node with `apk add nodejs npm` instead.".into(),
+        );
+    }
+
+    let file_name = format!("node-{NODE_LTS_VERSION}-{slug}.{}", node_archive_ext());
+    let sources = [("nodejs.org", NODE_DIST_BASE), ("npmmirror", NODE_MIRROR_DIST_BASE)];
+    let mut last_err = String::new();
+    for (label, base) in sources {
+        for attempt in 1..=NODE_DOWNLOAD_ATTEMPTS {
+            if attempt > 1 { std::thread::sleep(std::time::Duration::from_secs(1)); }
+            note(&format!("Node download attempt {attempt}/{NODE_DOWNLOAD_ATTEMPTS} from {label}"));
+            match download_node_archive(base, &file_name, app) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    note(&format!("Node download attempt {attempt} from {label} failed: {e}"));
+                    last_err = format!("{label}: {e}");
+                }
+            }
+        }
+    }
+    Err(format!("All Node download sources failed — last error from {last_err}"))
+}
+
+// Fetch from one base, verify, extract, and prove the binary runs here
+fn download_node_archive(base: &str, file_name: &str, app: &AppHandle) -> Result<(), String> {
+    let url = format!("{base}/{NODE_LTS_VERSION}/{file_name}");
+    note(&format!("Downloading {url}"));
+    let _ = app.emit("setup_progress", "Downloading Node.js...");
+
+    let data = download_with_progress(&url, app)?;
+
+    // A corrupt or tampered archive must never reach extraction.
+    // Same-base checksum: TLS guards transport, SHA guards corruption.
+    match fetch_expected_sha(base, file_name) {
+        Some(expected) => {
+            let actual = sha256_hex(&data);
+            if actual != expected {
+                return Err("Node.js download failed checksum verification".into());
+            }
+        }
+        None => return Err("Could not verify the Node.js download (checksum unavailable)".into()),
+    }
+
+    let _ = app.emit("setup_progress", "Extracting Node.js...");
+    let dest = format!("{}/{NODE_CACHE_DIR}", home_dir());
+    let dest = std::path::Path::new(&dest);
+    // Start clean so a half-extracted previous attempt can't shadow this one
+    let _ = std::fs::remove_dir_all(dest);
+    std::fs::create_dir_all(dest).map_err(|e| format!("Cannot create {}: {e}", dest.display()))?;
+
+    if let Err(e) = extract_archive(&data, dest) {
+        let _ = std::fs::remove_dir_all(dest);
+        return Err(e);
+    }
+
+    // Prove it runs here rather than failing later inside npm
+    let node = cached_node_path();
+    match node_version(&node) {
+        Some(v) if v >= MIN_NODE => {
+            note(&format!("Node {}.{} ready at {node}", v.0, v.1));
+            Ok(())
+        }
+        _ => {
+            let _ = std::fs::remove_dir_all(dest);
+            Err("The downloaded Node.js does not run on this system".into())
+        }
+    }
+}
+
+// Guarantees a usable Node before anything tries to run npm or the host.
+fn ensure_node(app: &AppHandle) -> bool {
+    if !node_missing() {
+        let node = find_node_binary();
+        let v = node_version(&node).unwrap_or((0, 0));
+        note(&format!("Using Node {}.{} at {node}", v.0, v.1));
+        return true;
+    }
+    note(&format!("No Node >= {}.{} found — downloading", MIN_NODE.0, MIN_NODE.1));
+    match download_node(app) {
+        Ok(()) => true,
+        Err(e) => {
+            note(&format!("Node download failed: {e}"));
+            let _ = app.emit("setup_error", e);
+            false
+        }
+    }
+}
+
+// npm's JS entrypoint, run via node. Avoids npm.cmd: CreateProcessW cannot execute
+// batch files directly, and Rust's verbatim paths break cmd.exe (rust-lang/rust#95178).
+fn find_npm_cli() -> Option<String> {
+    let node = find_node_binary();
+    let dir = std::path::Path::new(&node).parent()?;
+    // Windows keeps npm beside node.exe; POSIX puts it in <prefix>/lib/node_modules
+    let roots = [dir.to_path_buf(), dir.parent()?.join("lib")];
+    roots
+        .iter()
+        .map(|r| r.join("node_modules/npm/bin/npm-cli.js"))
+        .find(|p| p.exists())
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+// ── Install + spawn ─────────────────────────────────────────────────────────
+
+fn is_f3mote_installed() -> bool {
+    std::path::Path::new(&cli_path()).exists()
+}
+
+// Streams npm output so the UI shows live progress; kills the run past the timeout.
+// `progress` None = silent (background update).
+fn run_npm_install(target: &str, progress: Option<&AppHandle>) -> bool {
+    let prefix = npm_prefix();
+    if let Err(e) = std::fs::create_dir_all(&prefix) {
+        note(&format!("mkdir prefix failed: {e}"));
+        if let Some(app) = progress {
+            let _ = app.emit("setup_error", format!("Cannot create {prefix}: {e}"));
+        }
+        return false;
+    }
+
+    // ensure_node() runs first in the startup path; this only guards the background
+    // update, which has no AppHandle to download through.
+    if node_missing() {
+        note("No usable Node.js — skipping npm run");
+        if let Some(app) = progress {
+            let _ = app.emit("setup_error", format!("Node.js not found. Install it from {NODE_DOWNLOAD_URL}, then reopen f3mote."));
+        }
+        return false;
+    }
+
+    let node = find_node_binary();
+    let Some(npm_cli) = find_npm_cli() else {
+        note(&format!("npm not found next to node ({node})"));
+        if let Some(app) = progress {
+            let _ = app.emit("setup_error", format!("npm not found. Reinstall Node.js from {NODE_DOWNLOAD_URL}."));
+        }
+        return false;
+    };
+
+    // Registry None = npm default. Retries clear transient AV file locks (EBUSY/EPERM);
+    // the mirror covers networks npmjs.org can't reach.
+    for (i, registry) in [None, None, Some(NPM_MIRROR_REGISTRY)].into_iter().enumerate() {
+        note(&format!("npm install {target}: attempt {} ({})", i + 1, registry.unwrap_or("registry.npmjs.org")));
+        if npm_install_once(&node, &npm_cli, &prefix, target, registry, false, progress) {
+            return true;
+        }
+    }
+
+    // Fallback: retry with --ignore-scripts if lifecycle scripts fail (e.g. AV blocks, missing toolchains)
+    note(&format!("npm install {target}: standard attempts failed, falling back to --ignore-scripts"));
+    for (i, registry) in [None, Some(NPM_MIRROR_REGISTRY)].into_iter().enumerate() {
+        note(&format!("npm install {target}: fallback attempt {} ({}, --ignore-scripts)", i + 1, registry.unwrap_or("registry.npmjs.org")));
+        if npm_install_once(&node, &npm_cli, &prefix, target, registry, true, progress) {
+            return true;
+        }
+    }
+
+    if let Some(app) = progress {
+        let _ = app.emit("setup_error", "Install failed. Check that you are online, then reopen f3mote.");
+    }
+    false
+}
+
+fn npm_install_once(
+    node: &str,
+    npm_cli: &str,
+    prefix: &str,
+    target: &str,
+    registry: Option<&str>,
+    ignore_scripts: bool,
+    progress: Option<&AppHandle>,
+) -> bool {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let mut npm = Command::new(node);
+    npm.args([npm_cli, "install", "--prefix", prefix, "--no-audit", "--no-fund", "--loglevel", "http", target])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if ignore_scripts {
+        npm.arg("--ignore-scripts");
+    }
+    apply_node_path(&mut npm, node); // koffi's install script shells out to bare `node`
+    if let Some(registry) = registry {
+        npm.args(["--registry", registry]);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        npm.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = match npm.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            note(&format!("npm spawn failed ({npm_cli}): {e}"));
+            if let Some(app) = progress {
+                let _ = app.emit("setup_error", format!("Cannot run npm: {e}"));
+            }
+            return false;
+        }
+    };
+
+    if let Some(app) = progress {
+        let _ = app.emit("setup_progress", format!("Downloading {target}..."));
+    }
+
+    // npm writes progress to stderr; count fetched packages for a live counter
+    if let Some(err) = child.stderr.take() {
+        let app = progress.cloned();
+        std::thread::spawn(move || {
+            let mut fetched = 0usize;
+            for line in BufReader::new(err).lines().map_while(Result::ok) {
+                eprintln!("[npm] {line}");
+                if !line.contains("http fetch") { continue; }
+                fetched += 1;
+                if fetched % 10 != 0 { continue; }
+                if let Some(app) = &app {
+                    let _ = app.emit("setup_progress", format!("Downloading packages... ({fetched})"));
+                }
+            }
+        });
+    }
+    if let Some(out) = child.stdout.take() {
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines().map_while(Result::ok) {
+                eprintln!("[npm] {line}");
+            }
+        });
+    }
+
+    // Watchdog: kill the install if it exceeds the timeout
+    let done = Arc::new(AtomicBool::new(false));
+    let killer = done.clone();
+    let pid = child.id();
+    std::thread::spawn(move || {
+        for _ in 0..NPM_INSTALL_TIMEOUT_SECS {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if killer.load(Ordering::Relaxed) { return; }
+        }
+        note(&format!("npm install timed out after {NPM_INSTALL_TIMEOUT_SECS}s, killing {pid}"));
+        // taskkill /T takes the whole npm→node tree, matching the unix process-group kill
+        #[cfg(not(windows))]
+        let _ = std::process::Command::new("kill").arg("-9").arg(pid.to_string()).status();
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/T", "/F"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+        }
+    });
+
+    let status = child.wait();
+    done.store(true, Ordering::Relaxed);
+
+    match status {
+        Ok(s) if s.success() => true,
+        Ok(s) => {
+            note(&format!("npm install {target} exited with {s}"));
+            false
+        }
+        Err(e) => {
+            note(&format!("npm wait failed: {e}"));
+            false
+        }
+    }
+}
+
+fn ensure_f3mote_installed(app: &AppHandle) -> bool {
+    if is_f3mote_installed() {
+        let path = cli_path();
+        let source = if global_cli_path().as_deref() == Some(path.as_str()) { "global" } else { "private" };
+        note(&format!("Found cli.cjs ({source}) at {path}"));
+        return true;
+    }
+    note(&format!("Installing {NPM_PACKAGE} to {} ...", npm_prefix()));
+    let _ = app.emit("setup_progress", "Installing f3mote (first time)...");
+    if run_npm_install(NPM_PACKAGE, Some(app)) {
+        note("Install OK");
+        let _ = app.emit("setup_progress", "Install complete, starting...");
+        is_f3mote_installed()
+    } else {
+        false
+    }
+}
+
+// Silent background update; runs after host is up so user is never blocked
+fn spawn_background_update(app: AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        // A global install updates itself (host's own updateChecker) — don't shadow it with a private copy
+        if global_cli_path().is_some_and(|g| g == cli_path()) {
+            eprintln!("[Desktop] Using global install — skipping private update");
+            return;
+        }
+        eprintln!("[Desktop] Checking for updates in background...");
+        let target = format!("{NPM_PACKAGE}@latest");
+        if run_npm_install(&target, None) {
+            eprintln!("[Desktop] Background update complete (applies on next launch)");
+            let _ = app.emit("update_ready", ());
+        } else {
+            eprintln!("[Desktop] Background update failed — staying on current version");
+            let _ = app.emit("update_failed", ());
+        }
+    });
+}
+
+// Check and install native shell updates via tauri-plugin-updater
+fn check_desktop_update(app: AppHandle, notify_if_latest: bool) {
+    use tauri_plugin_updater::UpdaterExt;
+    tauri::async_runtime::spawn(async move {
+        match app.updater() {
+            Ok(updater) => {
+                match updater.check().await {
+                    Ok(Some(update)) => {
+                        eprintln!("[Desktop] Native update available: {}", update.version);
+                        let _ = app.emit("native_update_available", &update.version);
+                        use tauri_plugin_notification::NotificationExt;
+                        let _ = app.notification()
+                            .builder()
+                            .title("f3mote Update Available")
+                            .body(format!("Version {} is available. Downloading...", update.version))
+                            .show();
+                        if let Err(e) = update.download_and_install(|_, _| {}, || {}).await {
+                            eprintln!("[Desktop] Failed to download/install update: {e}");
+                        } else {
+                            eprintln!("[Desktop] Native update installed successfully");
+                            let _ = app.notification()
+                                .builder()
+                                .title("f3mote Update Ready")
+                                .body("Update installed. Restart the app to apply.")
+                                .show();
+                        }
+                    }
+                    Ok(None) => {
+                        eprintln!("[Desktop] Native app is up to date");
+                        if notify_if_latest {
+                            use tauri_plugin_notification::NotificationExt;
+                            let _ = app.notification()
+                                .builder()
+                                .title("f3mote")
+                                .body("You are using the latest version.")
+                                .show();
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[Desktop] Failed to check native update: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[Desktop] Updater error: {e}");
+            }
+        }
+    });
+}
+
+// Spawn host directly via node (skip npm exec overhead) + new process group
+fn spawn_f3mote_ui(app: AppHandle) {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::process::{Command, Stdio};
+        use std::io::{BufRead, BufReader};
+
+        let node = find_node_binary();
+        let cli = cli_path();
+        eprintln!("[Desktop] Spawning: {node} {cli} ui");
+        let _ = app.emit("setup_progress", "Starting f3mote server...");
+
+        let mut cmd = Command::new(&node);
+        cmd.arg(&cli).arg("ui").arg("--start") // --start: open the tunnel without waiting for a click
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null()); // GUI apps have no usable stdin — don't let the host inherit it
+
+        apply_node_path(&mut cmd, &node); // the host respawns its server as bare `node`
+
+        // Mark the host as shell-hosted: it must never spawn its own tray icon
+        // (this shell owns one). Inherited through its self-update restart.
+        cmd.env("NREMOTE_DESKTOP", "1");
+
+        // New process group so SIGTERM to -pid kills entire tree on shutdown
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            unsafe { cmd.pre_exec(|| { libc::setsid(); Ok(()) }); }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW — a GUI app has no console,
+            // so the child would otherwise allocate a visible one.
+            cmd.creation_flags(0x00000200 | CREATE_NO_WINDOW);
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[Desktop] Failed to spawn agent: {e}");
+                let _ = app.emit("setup_progress", format!("Error spawning: {e}"));
+                return;
+            }
+        };
+
+        if let Ok(mut g) = get_agent_pid().lock() { *g = Some(child.id()); }
+
+        if let Some(stdout) = child.stdout.take() {
+            std::thread::spawn(move || {
+                for line in BufReader::new(stdout).lines().flatten() {
+                    eprintln!("[f3mote] {line}");
+                    if HOST_CAPTURE.load(std::sync::atomic::Ordering::Relaxed) {
+                        push_host_log(&line);
+                        note(&format!("host | {line}"));
+                    }
+                }
+            });
+        }
+        if let Some(stderr) = child.stderr.take() {
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines().flatten() {
+                    eprintln!("[f3mote.err] {line}");
+                    if HOST_CAPTURE.load(std::sync::atomic::Ordering::Relaxed) {
+                        push_host_log(&format!("[err] {line}"));
+                        note(&format!("host.err | {line}"));
+                    }
+                }
+            });
+        }
+
+        // Poll health until ready — sub-second interval so a fast boot isn't rounded up to 1s
+        let _ = app.emit("setup_progress", "Starting server...");
+        let url = format!("http://localhost:{SERVER_PORT}/api/health");
+        let attempts = HEALTH_TIMEOUT_SECS * 1000 / HEALTH_POLL_MS;
+        let almost_ready_at = 15 * 1000 / HEALTH_POLL_MS;
+        for i in 0..attempts {
+            if i == almost_ready_at { let _ = app.emit("setup_progress", "Almost ready..."); }
+            if let Ok(resp) = ureq::get(&url).call() {
+                if resp.status() == 200 {
+                    eprintln!("[Desktop] Server ready after {}ms", (i + 1) * HEALTH_POLL_MS);
+                    HOST_CAPTURE.store(false, std::sync::atomic::Ordering::Relaxed);
+                    let _ = app.emit("setup_ready", ());
+                    // Navigate from Rust: the splash cannot fetch/redirect itself
+                    // (tauri://localhost → http://localhost is cross-origin, blocked by WKWebView)
+                    if let Some(win) = app.get_webview_window("main") {
+                        let _ = win.eval(&format!("window.location.href = 'http://localhost:{SERVER_PORT}'"));
+                    }
+                    // Update only once the host is serving — never overwrite files it is reading
+                    spawn_background_update(app.clone());
+                    check_desktop_update(app.clone(), false);
+                    break;
+                }
+            }
+            if i + 1 == attempts {
+                eprintln!("[Desktop] Server timeout {HEALTH_TIMEOUT_SECS}s");
+                // Show why: exit status + the host's last words, right in the splash
+                let exit = match child.try_wait() {
+                    Ok(Some(s)) => format!(" — host exited with {s}"),
+                    _ => String::new(),
+                };
+                let tail = host_log_tail(15);
+                let tail = if tail.is_empty() { String::new() } else { format!("\n\n{tail}") };
+                let _ = app.emit(
+                    "setup_error",
+                    format!("Server did not start in time{exit}.\nFull log: ~/.f3mote/setup.log{tail}"),
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(HEALTH_POLL_MS));
+        }
+
+        let _ = child.wait();
+    });
+}
+
+// Navigate webview window to url and bring window to front
+fn navigate_and_show(app: &AppHandle, url: &str) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+        let _ = win.eval(&format!("window.location.href = '{url}'"));
+    }
+}
+
+// ── Main run ───────────────────────────────────────────────────────────────
+
+pub fn run() {
+    let is_dev = std::env::var("NINEREMOTE_ENV")
+        .map(|v| v == "development")
+        .unwrap_or(false);
+
+    tauri::Builder::default()
+        .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .on_page_load(|webview, payload| {
+            // The host UI opens login/docs links via window.open + target="_blank", which
+            // Tauri's webview swallows. Reroute them to the OS browser. Only act inside the
+            // Tauri shell — the same UI served standalone in a regular browser is untouched.
+            if payload.event() != tauri::webview::PageLoadEvent::Finished { return; }
+            // http://localhost = host UI; tauri://localhost = splash, skip it
+            let url = payload.url();
+            if url.scheme() != "http" || url.host_str() != Some("localhost") { return; }
+            // window.open() is not covered by opener's click handler, so route it
+            // manually. target="_blank" links are handled by the opener plugin itself.
+            let js = r#"
+                (function(){
+                    if (window.__9r_external_patched) return;
+                    window.__9r_external_patched = true;
+                    var invoke = window.__TAURI_INTERNALS__.invoke;
+                    var openExt = function(url){ if(url) invoke('open_external', { url: String(url) }); };
+                    window.open = function(url){
+                        if (url) { openExt(url); return null; }
+                        // Host uses window.open("") then .location.href = X to dodge popup
+                        // blockers — proxy the href setter so the URL still reaches the browser.
+                        var loc = {};
+                        Object.defineProperty(loc, 'href', {
+                            set: function(v){ openExt(String(v)); },
+                            get: function(){ return ''; }
+                        });
+                        return { location: loc, close: function(){}, focus: function(){} };
+                    };
+                    window.__9R_DESKTOP__ = {
+                        showNotification: function(title, body) {
+                            try { invoke('show_notif', { title: String(title || 'f3mote'), body: String(body || '') }); } catch(e){}
+                        },
+                        setBadge: function(count) {
+                            try { invoke('set_badge', { count: Number(count || 0) }); } catch(e){}
+                        }
+                    };
+                    window.addEventListener('contextmenu', function(e) {
+                        var tag = e.target && e.target.tagName;
+                        if (tag === 'INPUT' || tag === 'TEXTAREA' || (e.target && e.target.isContentEditable)) return;
+                        e.preventDefault();
+                    }, false);
+                })();
+            "#;
+            let _ = webview.eval(js);
+
+            #[cfg(target_os = "macos")]
+            if let Ok(ns_win) = webview.window().ns_window() {
+                center_window_title(ns_win);
+            }
+        })
+        .setup(move |app| {
+            #[cfg(target_os = "macos")]
+            if let Some(win) = app.get_webview_window("main") {
+                if let Ok(ns_win) = win.ns_window() {
+                    center_window_title(ns_win);
+                }
+            }
+
+            // ── System tray ──
+            let version = env!("CARGO_PKG_VERSION");
+            let header = MenuItem::with_id(app, "header", format!("● f3mote v{version}"), false, None::<&str>)?;
+            let sep1 = PredefinedMenuItem::separator(app)?;
+            // Menu icons are brand-colored PNGs (scripts/genMenuIcons.mjs), not emoji
+            let icon = |bytes: &'static [u8]| Image::from_bytes(bytes);
+            let pair = IconMenuItem::with_id(app, "pair_device", "Pair Device (QR Code)", true, Some(icon(include_bytes!("../icons/menu/pair.png"))?), None::<&str>)?;
+            let local_ws = IconMenuItem::with_id(app, "local_workspace", "Local Workspace", true, Some(icon(include_bytes!("../icons/menu/local.png"))?), None::<&str>)?;
+            let remote_ws = IconMenuItem::with_id(app, "remote_workspace", "Remote Workspace", true, Some(icon(include_bytes!("../icons/menu/remote.png"))?), None::<&str>)?;
+            let sep2 = PredefinedMenuItem::separator(app)?;
+            let restart = IconMenuItem::with_id(app, "restart_agent", "Restart Agent", true, Some(icon(include_bytes!("../icons/menu/restart.png"))?), None::<&str>)?;
+            let check_update = IconMenuItem::with_id(app, "check_update", "Check for Updates", true, Some(icon(include_bytes!("../icons/menu/update.png"))?), None::<&str>)?;
+            let sep3 = PredefinedMenuItem::separator(app)?;
+            let quit = IconMenuItem::with_id(app, "quit", "Quit f3mote", true, Some(icon(include_bytes!("../icons/menu/quit.png"))?), Some("CmdOrCtrl+Q"))?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &header,
+                    &sep1,
+                    &pair,
+                    &local_ws,
+                    &remote_ws,
+                    &sep2,
+                    &restart,
+                    &check_update,
+                    &sep3,
+                    &quit,
+                ],
+            )?;
+
+            // Embedded host tray PNG (terminal glyph) — same icon as CLI tray
+            let tray_icon = Image::from_bytes(include_bytes!("../icons/trayIcon.png"))?;
+            TrayIconBuilder::new()
+                .icon(tray_icon)
+                .icon_as_template(false)
+                .menu(&menu)
+                .show_menu_on_left_click(false)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        button_state: MouseButtonState::Up,
+                        ..
+                    } = event
+                    {
+                        let app = tray.app_handle();
+                        if let Some(win) = app.get_webview_window("main") {
+                            if win.is_visible().unwrap_or(false) {
+                                let _ = win.hide();
+                            } else {
+                                let _ = win.show();
+                                let _ = win.unminimize();
+                                let _ = win.set_focus();
+                            }
+                        }
+                    }
+                })
+                .on_menu_event(move |app, event| match event.id.as_ref() {
+                    "pair_device" => {
+                        let url = if is_dev {
+                            format!("http://localhost:{VITE_PORT}")
+                        } else {
+                            format!("http://localhost:{SERVER_PORT}")
+                        };
+                        navigate_and_show(app, &url);
+                    }
+                    "local_workspace" => {
+                        let url = format!("http://localhost:{SERVER_PORT}/workspace");
+                        navigate_and_show(app, &url);
+                    }
+                    "remote_workspace" => {
+                        let url = format!("http://localhost:{SERVER_PORT}/login?mode=remote");
+                        navigate_and_show(app, &url);
+                    }
+                    "restart_agent" => {
+                        kill_agent_tree();
+                        let app_handle = app.clone();
+                        tauri::async_runtime::spawn_blocking(move || {
+                            spawn_f3mote_ui(app_handle);
+                        });
+                    }
+                    "check_update" => {
+                        spawn_background_update(app.clone());
+                        check_desktop_update(app.clone(), true);
+                    }
+                    "quit" => { kill_agent_tree(); app.exit(0); }
+                    _ => {}
+                })
+                .build(app)?;
+
+            // ── Dev: load Vite directly ──
+            if is_dev {
+                if let Some(win) = app.get_webview_window("main") {
+                    let url = format!("http://localhost:{VITE_PORT}");
+                    let _ = win.eval(&format!("window.location.href = '{url}'"));
+                }
+            } else {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    // spawn_f3mote_ui navigates the webview and kicks the update once healthy
+                    if ensure_node(&app_handle) && ensure_f3mote_installed(&app_handle) {
+                        spawn_f3mote_ui(app_handle);
+                    }
+                });
+            }
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            check_permissions,
+            request_permission,
+            quit_app,
+            set_badge,
+            show_notif,
+            open_external,
+        ])
+        .on_window_event(|window, event| {
+            // Close button → hide window (keep host alive in tray)
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = window.hide();
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while running tauri application")
+        .run(|app_handle, event| match event {
+            // Every exit path that Tauri sees lands here: Cmd+Q, dock quit, logout.
+            // The tray menu's own handler kills the host, but its CmdOrCtrl+Q
+            // accelerator only works while that menu is open — so Cmd+Q used to
+            // exit the shell and leave the host and cloudflared running, with the
+            // machine still reachable after the user believed they had quit.
+            // kill_agent_tree() takes the stored pid, so a second call is a no-op.
+            tauri::RunEvent::ExitRequested { .. } => kill_agent_tree(),
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => {
+                if let Some(win) = app_handle.get_webview_window("main") {
+                    let _ = win.show();
+                    let _ = win.unminimize();
+                    let _ = win.set_focus();
+                    let _ = win.eval("window.dispatchEvent(new CustomEvent('f3mote:dock-click'))");
+                }
+            }
+            _ => {}
+        });
+}
+
+#[cfg(test)]
+mod tests {
+    // The layout the PATH fix rests on: our node dir first, the inherited PATH intact
+    // behind it, the GUI-install fallbacks last.
+    #[test]
+    fn apply_node_path_orders_node_dir_inherited_then_extras() {
+        let node = "/tmp/f3mote-test/bin/node";
+        let mut cmd = std::process::Command::new(node);
+        super::apply_node_path(&mut cmd, node);
+        let path = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new("PATH"))
+            .and_then(|(_, v)| v)
+            .expect("apply_node_path must set PATH");
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let entries: Vec<&str> = path.to_str().unwrap().split(sep).collect();
+        assert_eq!(entries.first(), Some(&"/tmp/f3mote-test/bin"));
+        // or the child loses every tool but node
+        for inherited in std::env::var("PATH").unwrap_or_default().split(sep).filter(|e| !e.is_empty()) {
+            assert!(entries.contains(&inherited), "inherited PATH entry {inherited} was dropped");
+        }
+        // pinned by position, not by `contains`: the ambient PATH already holds some of these
+        #[cfg(unix)]
+        {
+            let home = super::home_dir();
+            let want = [
+                format!("{home}/.local/bin"),
+                "/opt/homebrew/bin".into(),
+                "/usr/local/bin".into(),
+                format!("{home}/.cargo/bin"),
+                format!("{home}/.bun/bin"),
+            ];
+            assert_eq!(entries[entries.len() - want.len()..], want[..], "extra bins must be the PATH tail");
+        }
+    }
+}

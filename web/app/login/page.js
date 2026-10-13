@@ -1,0 +1,687 @@
+"use client";
+
+import { useState, useEffect, useRef, Suspense, useMemo, useCallback } from "react";
+import { useSearchParams, useRouter } from "next/navigation";
+import { useAuth } from "@/shared/hooks/useAuth";
+import { useApiKeyStorage } from "@/shared/hooks/useApiKeyStorage";
+import { maskApiKey } from "@/shared/utils/formatters";
+import Container from "@/shared/components/ui/Container";
+import Icon from "@/shared/components/ui/Icon";
+import QRScanner from "@/shared/components/ui/QRScanner";
+import Button from "@/shared/components/ui/Button";
+import Spinner from "@/shared/components/ui/Spinner";
+import ConfirmDialog from "@/shared/components/ui/ConfirmDialog";
+import AnimatedBackground from "@/features/landing/components/AnimatedBackground";
+import LanguageSwitcher from "@/shared/components/ui/LanguageSwitcher";
+import ThemeToggle from "@/shared/theme/ThemeToggle";
+import { useI18n } from "@/shared/i18n";
+import { X } from "@/shared/components/ui/Icon";
+import CodespaceList from "@/features/codespace/components/CodespaceList";
+import { useGithub } from "@/features/codespace/hooks/useGithub";
+import { useSessionStorage, clearRememberedAuth } from "@/shared/hooks/useSessionStorage";
+import { buildCodespaceUrl } from "@/shared/constants/github";
+import { setTrust, withTail } from "@/shared/transport/lib/deviceTrust";
+import { LOGIN_ERROR_KEY, ONE_TIME_CODE_LENGTH, PENDING_SAVE_KEY } from "@/shared/constants/transport";
+import { headOf, tailOf, isLegacyApiKey } from "@/shared/utils/apiKey";
+import { isLoopbackOrigin } from "@/shared/utils/localOrigin";
+import { parsePairingInput } from "@/features/hosts/lib/parsePairingInput";
+import { finishPairingLogin, armPairingSave } from "@/features/hosts/lib/switchHost";
+import { AGENT_PORT } from "@/shared/constants/API";
+
+
+function LoginContent() {
+  const { t } = useI18n();
+  const [apiKey, setApiKey] = useState("");
+  const [rememberKey, setRememberKey] = useState(true);
+  const [savedKeys, setSavedKeys] = useState([]);
+  const [isHydrated, setIsHydrated] = useState(false);
+  const [showQRScanner, setShowQRScanner] = useState(false);
+  const [authTab, setAuthTab] = useState("local");
+  const [editingKeyId, setEditingKeyId] = useState(null);
+  const [editingLabel, setEditingLabel] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [loginLoadingKey, setLoginLoadingKey] = useState(null);
+  const [localServerKey, setLocalServerKey] = useState(null);
+  const version = process.env.NEXT_PUBLIC_SERVER_VERSION;
+
+  const { token: githubToken, clearToken: clearGithubToken } = useGithub();
+  const { getAuth, setAuth } = useSessionStorage();
+
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const { loading, error, setError, authenticateWithToken, authenticateWithApiKey } = useAuth();
+  const [tailRejected, setTailRejected] = useState(false);
+  const { loadKeys, saveKey, removeKey, renameKey, hasStoredKeys, updateLastLogin } = useApiKeyStorage();
+  const hasLegacySavedKey = useMemo(() => savedKeys.some((item) => isLegacyApiKey(item.key)), [savedKeys]);
+
+  // Parse and stash QR token/tempKey from URL hash or query.
+  const token = useMemo(() => searchParams.get("t"), [searchParams]);
+  const [tempKey] = useState(() => {
+    if (typeof window === "undefined") return null;
+    try {
+      const stashed = sessionStorage.getItem("f3mote_url_pairing");
+      if (stashed) return stashed;
+      const parsed = parsePairingInput(window.location.hash) || parsePairingInput(window.location.search);
+      if (parsed?.tempKey) {
+        sessionStorage.setItem("f3mote_url_pairing", parsed.tempKey + (parsed.tail || ""));
+        return parsed.tempKey + (parsed.tail || "");
+      }
+    } catch {}
+    return null;
+  });
+  const isTokenAuth = !!token || !!tempKey;
+
+  // Remembered login: a key that outlived the tab goes straight to the workspace,
+  // with no network check — the workspace's reconnect screen owns an unreachable
+  // host, and blocking the login page on a round-trip would defeat the point.
+  const autoLoginDone = useRef(false);
+  useEffect(() => {
+    if (autoLoginDone.current) return;
+    // A pairing link or a rejection reason on screen outranks a stale key.
+    if (token || tempKey || sessionStorage.getItem(LOGIN_ERROR_KEY)) return;
+    // On the agent's own port the effect below re-reads /api/ui/state, which is
+    // fresher than anything remembered — including a `?mode=remote` intent.
+    if (isLoopbackOrigin() && window.location.port === String(AGENT_PORT)) return;
+    if (sessionStorage.getItem("f3mote_manual_disconnect") === "1") return;
+    if (!getAuth()?.apiKey) return;
+    autoLoginDone.current = true;
+    router.replace("/workspace/");
+  }, [token, tempKey, getAuth, router]);
+
+  useEffect(() => {
+    if (window.location.hash || window.location.search) {
+      const parsed = parsePairingInput(window.location.hash) || parsePairingInput(window.location.search);
+      if (parsed?.tempKey) window.history.replaceState(null, "", window.location.pathname);
+    }
+    const savedPreference = localStorage.getItem("f3mote_remember_key_preference");
+    setRememberKey(savedPreference !== "false");
+    setSavedKeys(loadKeys());
+    setIsHydrated(true);
+    if (sessionStorage.getItem(LOGIN_ERROR_KEY)) {
+      sessionStorage.removeItem(LOGIN_ERROR_KEY);
+      setTailRejected(true);
+    }
+    if (githubToken) {
+      setAuthTab("github");
+    }
+
+    // Auto-connect when page is served directly by the agent on AGENT_PORT.
+    if (isLoopbackOrigin() && window.location.port === String(AGENT_PORT)) {
+      fetch("/api/ui/state")
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => {
+          if (data?.permanentKey) {
+            setLocalServerKey(data.permanentKey);
+            const isRemoteMode = searchParams.get("mode") === "remote";
+            if (isRemoteMode) {
+              try { sessionStorage.setItem("f3mote_manual_disconnect", "1"); } catch {}
+            }
+            const manualDisconnect = isRemoteMode || sessionStorage.getItem("f3mote_manual_disconnect") === "1";
+            if (!manualDisconnect) {
+              const fullKey = data.permanentKey;
+              const head = headOf(fullKey);
+              const tail = tailOf(fullKey);
+              setTrust(head, { tail });
+              setAuth({
+                apiKey: head,
+                tunnelUrl: window.location.origin,
+                mode: "local",
+                tempKey: null,
+                localIp: null
+              });
+              router.push("/workspace/");
+            }
+          }
+        })
+        .catch(() => {});
+    }
+  }, [loadKeys, githubToken, router, setAuth, searchParams]);
+
+  const handleConnectLocalServer = () => {
+    if (!localServerKey) return;
+    sessionStorage.removeItem("f3mote_manual_disconnect");
+    const head = headOf(localServerKey);
+    const tail = tailOf(localServerKey);
+    setTrust(head, { tail });
+    setAuth({
+      apiKey: head,
+      tunnelUrl: window.location.origin,
+      mode: "local",
+      tempKey: null,
+      localIp: null
+    });
+    router.push("/workspace/");
+  };
+
+  const handleGithubAuthenticated = () => {};
+
+  const handleGithubLogout = () => {
+    clearGithubToken();
+  };
+
+  const handleCodespaceConnect = (cs, apiKey) => {
+    const tunnelUrl = buildCodespaceUrl(cs.name);
+    setAuth({
+      apiKey: headOf(apiKey),
+      tunnelUrl,
+      mode: "remote"
+    });
+    router.push("/workspace/");
+  };
+
+  const handleRememberChange = (checked) => {
+    setRememberKey(checked);
+    if (typeof window === "undefined") return;
+    localStorage.setItem("f3mote_remember_key_preference", checked);
+    // Turning the switch off must also drop a mirror an earlier session left
+    // behind — otherwise the key survives a choice that said not to keep it.
+    if (!checked) clearRememberedAuth();
+  };
+
+  const authenticateWithTempKey = useCallback(async (stashed) => {
+    const parsed = parsePairingInput(stashed);
+    armPairingSave(localStorage.getItem("f3mote_remember_key_preference") !== "false");
+    const result = await authenticateWithToken(parsed?.tempKey || stashed, true, parsed?.tail);
+    try { sessionStorage.removeItem("f3mote_url_pairing"); } catch {}
+    if (result.success) {
+      finishPairingLogin(parsed, {
+        remember: typeof window === "undefined" || localStorage.getItem("f3mote_remember_key_preference") !== "false"
+      });
+    }
+  }, [authenticateWithToken]);
+
+  // Guard against duplicate authentication in React StrictMode.
+  const tokenAuthStarted = useRef(false);
+  useEffect(() => {
+    if (!token && !tempKey) return;
+    if (tokenAuthStarted.current) return;
+    tokenAuthStarted.current = true;
+    if (token) {
+      authenticateWithToken(token);
+    } else {
+      authenticateWithTempKey(tempKey);
+    }
+  }, [token, tempKey, authenticateWithToken, authenticateWithTempKey]);
+
+  const handleConnect = async () => {
+    const trimmedKey = apiKey.trim();
+    if (!trimmedKey) return;
+
+    if (isLegacyApiKey(trimmedKey)) {
+      setError(t("login.legacyKeyError"));
+      return;
+    }
+
+    const parsed = parsePairingInput(trimmedKey);
+    const isOneTime = !!parsed?.tempKey;
+
+    const routingKey = isOneTime ? parsed.tempKey : headOf(trimmedKey);
+    const tail = isOneTime ? parsed.tail : tailOf(trimmedKey);
+    if (isOneTime) armPairingSave(rememberKey);
+    const result = isOneTime
+      ? await authenticateWithToken(parsed.tempKey, true, parsed.tail)
+      : await authenticateWithApiKey(trimmedKey);
+    if (!result.success) return;
+
+    if (isOneTime) {
+      // Pairing codes defer save until the agent issues the key — one door,
+      // shared with the add-host modal (see finishPairingLogin).
+      finishPairingLogin(parsed, { remember: rememberKey });
+      return;
+    }
+
+    if (tail) setTrust(routingKey, { tail });
+    // Park key until agent accepts TAIL.
+    if (rememberKey) sessionStorage.setItem(PENDING_SAVE_KEY, trimmedKey);
+    router.push("/workspace/");
+  };
+
+  const handleLoginWithSavedKey = async (key) => {
+    if (!key) return;
+    if (isLegacyApiKey(key)) {
+      setError(t("login.legacyKeyError"));
+      return;
+    }
+    // Restore TAIL to trust store or repair key from stored trust.
+    const savedTail = tailOf(key);
+    if (savedTail) setTrust(headOf(key), { tail: savedTail });
+    const fullKey = savedTail ? key : withTail(key);
+    setLoginLoadingKey(key);
+    let result;
+    try {
+      result = await authenticateWithApiKey(fullKey);
+    } finally {
+      setLoginLoadingKey(null);
+    }
+    if (result?.success) {
+      if (fullKey !== key) saveKey(fullKey);
+      updateLastLogin(key);
+      router.push("/workspace/");
+    }
+  };
+
+  const handleConfirmRemoveKey = () => {
+    if (!deleteTarget) return;
+    removeKey(deleteTarget.id);
+    setSavedKeys(loadKeys());
+  };
+
+  const handleStartRename = (item) => {
+    setEditingKeyId(item.id);
+    setEditingLabel(item.label || "");
+  };
+
+  const handleSaveRename = (id) => {
+    renameKey(id, editingLabel.trim());
+    setSavedKeys(loadKeys());
+    setEditingKeyId(null);
+  };
+
+  const handleCancelRename = () => {
+    setEditingKeyId(null);
+  };
+
+  const handleQRScan = async (scanned) => {
+    const parsed = parsePairingInput(scanned);
+    if (!parsed?.tempKey) return false;
+    armPairingSave(localStorage.getItem("f3mote_remember_key_preference") !== "false");
+    const result = await authenticateWithToken(parsed.tempKey, true, parsed.tail);
+    if (!result.success) return false;
+    finishPairingLogin(parsed, {
+      remember: typeof window === "undefined" || localStorage.getItem("f3mote_remember_key_preference") !== "false"
+    });
+    return true;
+  };
+
+  const handleClearInput = () => {
+    setApiKey("");
+  };
+
+  const formatLoginDate = (dateString) => {
+    if (!dateString) return "";
+    try {
+      const date = new Date(dateString);
+      const now = new Date();
+      const diffMs = now - date;
+      const diffMins = Math.floor(diffMs / 60000);
+      const diffHours = Math.floor(diffMs / 3600000);
+      const diffDays = Math.floor(diffMs / 86400000);
+
+      if (diffMins < 1) return t("login.justNow");
+      if (diffMins < 60) return t("login.minutesAgo", { n: diffMins });
+      if (diffHours < 24) return t("login.hoursAgo", { n: diffHours });
+      if (diffDays < 7) return t("login.daysAgo", { n: diffDays });
+
+      return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    } catch {
+      return "";
+    }
+  };
+
+  if (isTokenAuth && loading) {
+    return (
+      <>
+        <AnimatedBackground />
+        <Container>
+          <div className="card-elev p-8 max-w-md w-full border border-border">
+            <Spinner size="lg" text={t("login.authenticating")} />
+          </div>
+        </Container>
+      </>
+    );
+  }
+
+  // Render GitHub flow (codespace list)
+  if (authTab === "github" && githubToken) {
+    return (
+      <>
+        <AnimatedBackground />
+        <Container>
+          <CodespaceList onConnect={handleCodespaceConnect} onLogout={handleGithubLogout} />
+        </Container>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <AnimatedBackground />
+      {isHydrated && isLoopbackOrigin() && (
+        <a
+          href="/"
+          className="fixed top-4 left-4 z-50 inline-flex items-center gap-2 px-3 py-1.5 text-xs font-medium text-text hover:text-white bg-surface-2/90 hover:bg-surface-3 border border-border-subtle rounded-brand-lg backdrop-blur-md transition-all shadow-sm active:scale-[0.97]"
+          title="Back to Host QR"
+        >
+          <Icon name="ChevronLeft" size={15} className="opacity-70" />
+          <Icon name="QrCode" size={15} className="text-brand-500" />
+          <span>Host QR</span>
+        </a>
+      )}
+      <div className="min-h-screen grid lg:grid-cols-2">
+        {/* HERO — hidden on mobile */}
+        <section className="hidden lg:flex flex-col justify-between px-12 xl:px-20 py-12 relative overflow-hidden">
+          <div className="login-hero-glow" aria-hidden />
+          <div className="my-auto max-w-xl relative z-10">
+            <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-surface-2/60 border border-border-subtle font-mono text-[11px] text-text-muted mb-7">
+              <span className="w-1.5 h-1.5 rounded-full bg-brand-500 animate-pulse-glow" />
+              {t("login.termConnected")} · {t("login.termTunnel")}
+            </div>
+            <h1 className="text-6xl xl:text-7xl font-extrabold tracking-tight leading-[0.98] mb-6 text-text">
+              {t("login.heroLine1")}<br/>
+              {t("login.heroLine2")}<br/>
+              <span className="login-hero-grad">{t("login.heroLine3")}</span>
+            </h1>
+            <p className="text-text-muted text-base lg:text-lg leading-relaxed max-w-md mb-8">
+              {t("login.tagline")}
+            </p>
+            <div className="flex flex-wrap gap-2 mb-9">
+              {["Terminal", "Desktop", "Files", "WebRTC low-latency", "iOS · Android · Web"].map((c) => (
+                <span
+                  key={c}
+                  className="font-mono text-xs text-text-muted px-3 py-1.5 rounded-full border border-border-subtle"
+                >
+                  {c}
+                </span>
+              ))}
+            </div>
+            {/* mini terminal mock — decorative */}
+            <div className="rounded-xl border border-border-subtle bg-surface-2/60 overflow-hidden max-w-md shadow-lg">
+              <div className="flex items-center gap-1.5 px-3 py-2 border-b border-border-subtle">
+                <span className="w-2.5 h-2.5 rounded-full bg-[#ff5f57]" />
+                <span className="w-2.5 h-2.5 rounded-full bg-[#febc2e]" />
+                <span className="w-2.5 h-2.5 rounded-full bg-[#28c840]" />
+                <span className="ml-2 font-mono text-[10px] text-text-subtle">dev@mac — zsh</span>
+              </div>
+              <div className="p-3.5 font-mono text-[12px] leading-relaxed">
+                <div><span className="text-text-subtle">➜</span> f3mote start</div>
+                <div className="text-text-subtle">↳ tunnel up · pairing open</div>
+                <div>
+                  <span className="text-brand-500">[ok]</span> <span className="text-text">machine</span> <span className="text-text-subtle">macbook-pro-m3</span>
+                </div>
+                <div>
+                  <span className="text-brand-500">[ok]</span> <span className="text-text">pty</span> <span className="text-text-subtle">daemon v3.1 · 12 warm</span>
+                </div>
+                <div>
+                  <span className="text-[#6aab6a]">●</span> <span className="text-text-subtle">waiting for phone…</span>{" "}
+                  <span className="inline-block w-[7px] h-[13px] bg-brand-500 align-middle animate-cursor-blink" />
+                </div>
+              </div>
+            </div>
+          </div>
+          {/* hero foot */}
+          <div className="flex flex-wrap gap-x-5 gap-y-1 font-mono text-[11px] text-text-subtle pt-8 relative z-10">
+            <span>› PTY persistent</span>
+            <span>› end-to-end encrypted</span>
+            <span>› open source</span>
+          </div>
+        </section>
+
+        {/* FORM */}
+        <section className="flex items-center justify-center p-6 sm:p-10 lg:border-l lg:border-border-subtle lg:bg-surface-1 relative">
+          <div className="login-mobile-glow lg:hidden" aria-hidden />
+          <div className="relative z-10 w-full max-w-sm space-y-4">
+
+            {/* Header */}
+            <div className="flex items-center gap-3 mb-6">
+              <img
+                src="/icon-192.png"
+                alt="f3mote Logo"
+                className="w-10 h-10 rounded-[11px] object-contain shadow-lg shadow-brand-500/20"
+              />
+              <div className="flex-1">
+                <h1 className="text-[22px] font-bold tracking-tight text-text leading-none">f3mote</h1>
+                {version && <p className="font-mono text-[11px] text-text-subtle mt-1">v{version}</p>}
+              </div>
+              <LanguageSwitcher />
+              <ThemeToggle />
+            </div>
+
+            {/* Tagline — mobile-only (hero hidden) */}
+            <p className="text-text-muted text-lg font-medium leading-snug pr-4 mb-6 lg:hidden">
+              {t("login.tagline")}
+            </p>
+
+            {/* Access Key label */}
+            <div className="flex items-center gap-2 mb-2.5">
+              <Icon name="KeyRound" className="text-text-muted opacity-70" size={14} />
+              <span className="text-[13px] font-semibold text-text">{t("login.accessKey")}</span>
+            </div>
+
+            {/* Key input */}
+            <div className="relative">
+              <input
+                id="accessKeyInput"
+                type="text"
+                value={apiKey}
+                onChange={(e) => {
+                  const raw = e.target.value;
+                  setApiKey(raw.length <= ONE_TIME_CODE_LENGTH ? raw.toUpperCase() : raw.toLowerCase());
+                }}
+                onKeyDown={(e) => e.key === "Enter" && apiKey && handleConnect()}
+                placeholder={t("login.placeholder")}
+                className="w-full pl-3.5 pr-20 py-3 bg-surface-2 border border-border-subtle rounded-[10px] font-mono text-sm text-text placeholder-text-subtle focus:outline-none focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 transition-all duration-150"
+              />
+              <div className="absolute right-2.5 top-1/2 -translate-y-1/2 flex items-center gap-1">
+                {apiKey && (
+                  <>
+                    <button
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={handleClearInput}
+                      className="w-7 h-7 grid place-items-center rounded-[7px] text-text-subtle hover:bg-surface-3 hover:text-text transition-colors"
+                      type="button"
+                    >
+                      <X size={16} />
+                    </button>
+                  </>
+                )}
+                <button
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => setShowQRScanner(true)}
+                  className="w-7 h-7 grid place-items-center rounded-[7px] text-text-subtle hover:bg-surface-3 hover:text-brand-500 transition-colors"
+                  type="button"
+                  aria-label={t("login.scanQr")}
+                >
+                  <Icon name="QrCode" size={16} />
+                </button>
+              </div>
+            </div>
+            {(error || tailRejected) && (
+              <p className="mt-2 text-xs font-mono text-danger">
+                {error === "agent-offline" ? t("login.agentOffline")
+                  : error && error !== "wrong-key-tail" ? error
+                  : t("login.invalidKeyTail")}
+              </p>
+            )}
+
+            {/* Remember key */}
+            <label className="flex items-center gap-2.5 cursor-pointer mt-4 select-none">
+              <input
+                type="checkbox"
+                checked={rememberKey}
+                onChange={(e) => handleRememberChange(e.target.checked)}
+                className="w-[15px] h-[15px] accent-brand-500"
+              />
+              <span className="text-[13px] text-text-muted">{t("login.rememberKey")}</span>
+            </label>
+
+            {/* Connect */}
+            <Button
+              variant="primary"
+              onClick={handleConnect}
+              loading={loading}
+              className="btn-cta w-full mt-4"
+            >
+              <span className="inline-flex items-center justify-center gap-2">
+                {t("login.connect")}
+                <Icon name="ArrowRight" size={16} />
+              </span>
+            </Button>
+
+            {/* Saved devices — mock-style list */}
+            {isHydrated && savedKeys.length > 0 && (
+              <div className="mt-5 pt-5 border-t border-border-subtle">
+                <div className="font-mono text-[11px] uppercase tracking-wider text-text-subtle mb-1 px-1">
+                  {t("login.savedKeys")}
+                </div>
+                {hasLegacySavedKey && (
+                  <div className="my-2.5 px-3 py-2.5 bg-amber-500/10 border border-amber-500/30 rounded-brand-lg flex items-start gap-2.5">
+                    <Icon name="AlertCircle" size={16} className="text-amber-500 shrink-0 mt-0.5" />
+                    <div className="min-w-0 flex-1">
+                      <div className="text-xs font-medium text-text">{t("login.legacyKeyUpdateRequired")}</div>
+                      <div className="text-xs text-text-muted mt-0.5">{t("login.legacyKeyUpdateHint")}</div>
+                      <code className="inline-block mt-1.5 px-2 py-0.5 bg-surface-2 border border-border text-text text-xs rounded font-mono select-all">
+                        npm i -g f3mote@latest
+                      </code>
+                    </div>
+                  </div>
+                )}
+                {savedKeys.map((item) => {
+                  const isEditing = editingKeyId === item.id;
+                  const isLoading = loginLoadingKey === item.key;
+                  const isLegacy = isLegacyApiKey(item.key);
+                  return (
+                    <div
+                      key={item.id}
+                      className={`flex items-center gap-3 px-1 py-2 rounded-[10px] hover:bg-surface-2 transition-colors cursor-pointer ${isLegacy ? "opacity-85" : ""}`}
+                      onClick={() => !isEditing && !isLoading && handleLoginWithSavedKey(item.key)}
+                      role="button"
+                      tabIndex={0}
+                    >
+                      {/* laptop icon */}
+                      <div className={`w-12 h-12 rounded-[12px] bg-surface-2 border ${isLegacy ? "border-amber-500/40 text-amber-500" : "border-border-subtle text-text-muted"} grid place-items-center flex-shrink-0`}>
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" strokeLinejoin="round" className="w-[26px] h-[26px]">
+                          <rect x="2" y="4" width="20" height="13" rx="2" />
+                          <line x1="2" y1="20" x2="22" y2="20" />
+                        </svg>
+                      </div>
+                      {/* meta */}
+                      <div className="flex-1 min-w-0">
+                        {isEditing ? (
+                          <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+                            <input
+                              autoFocus
+                              value={editingLabel}
+                              onChange={(e) => setEditingLabel(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") handleSaveRename(item.id);
+                                if (e.key === "Escape") handleCancelRename();
+                              }}
+                              placeholder={t("login.namePlaceholder")}
+                              className="flex-1 min-w-0 bg-surface-2 border border-brand-500 rounded-md text-text text-[13px] px-2 py-1 outline-none"
+                            />
+                            <button onClick={() => handleSaveRename(item.id)} className="w-6 h-6 grid place-items-center rounded-md bg-brand-500 text-white" aria-label={t("common.done")}>
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={3} strokeLinecap="round" strokeLinejoin="round" className="w-3 h-3"><polyline points="20 6 9 17 4 12" /></svg>
+                            </button>
+                            <button onClick={handleCancelRename} className="w-6 h-6 grid place-items-center rounded-md bg-surface-2 text-text-muted" aria-label={t("common.cancel")}>
+                              <X size={13} />
+                            </button>
+                          </div>
+                        ) : (
+                          <>
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-[13px] font-medium text-text truncate" title={item.label || t("agentSwitcher.unnamed")}>{item.label || t("agentSwitcher.unnamed")}</span>
+                              {isLegacy && (
+                                <span className="shrink-0 px-1.5 py-0.5 text-[9px] font-semibold font-mono uppercase rounded bg-amber-500/15 text-amber-500 border border-amber-500/30">
+                                  {t("login.updateRequired")}
+                                </span>
+                              )}
+                            </div>
+                            <div className="font-mono text-[11px] text-text-subtle mt-0.5 truncate">{maskApiKey(item.key)}</div>
+                          </>
+                        )}
+                      </div>
+                      {/* last login / loading */}
+                      {!isEditing && (
+                        <span className="font-mono text-[11px] text-text-subtle whitespace-nowrap">
+                          {isLoading ? t("agentSwitcher.connecting") : formatLoginDate(item.lastLoginDate)}
+                        </span>
+                      )}
+                      {/* rename / delete */}
+                      {!isEditing && (
+                        <div className="flex gap-0.5" onClick={(e) => e.stopPropagation()}>
+                          <button
+                            onClick={() => handleStartRename(item)}
+                            title={t("common.edit")}
+                            className="w-[26px] h-[26px] grid place-items-center rounded-[7px] text-text-subtle hover:bg-surface-3 hover:text-text transition-colors"
+                          >
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
+                              <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                              <path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z" />
+                            </svg>
+                          </button>
+                          <button
+                            onClick={() => setDeleteTarget(item)}
+                            title={t("common.delete")}
+                            className="w-[26px] h-[26px] grid place-items-center rounded-[7px] text-text-subtle hover:bg-surface-3 hover:text-danger transition-colors"
+                          >
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
+                              <polyline points="3 6 5 6 21 6" />
+                              <path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                            </svg>
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Secure badge */}
+            <div className="flex items-center justify-center gap-2 pt-1 text-text-subtle">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className="w-3.5 h-3.5">
+                <path d="M12 2l9 4v6c0 5-3.8 9.7-9 11-5.2-1.3-9-6-9-11V6l9-4z" />
+              </svg>
+              <span className="font-mono text-[11px]">{t("login.secureTitle")}</span>
+            </div>
+          </div>
+        </section>
+      </div>
+
+      {/* QR Scanner Modal */}
+      <QRScanner
+        isOpen={showQRScanner}
+        onClose={() => setShowQRScanner(false)}
+        onScan={handleQRScan}
+      />
+
+      {/* Delete key confirmation */}
+      <ConfirmDialog
+        isOpen={!!deleteTarget}
+        onClose={() => setDeleteTarget(null)}
+        onConfirm={handleConfirmRemoveKey}
+        title={t("login.deleteKeyTitle")}
+        message={t("login.deleteKeyConfirm", { name: deleteTarget?.label })}
+        confirmText={t("common.delete")}
+      />
+    </>
+  );
+}
+
+// Plain <a> reload link works without JavaScript loaded.
+function LoginFallback() {
+  return (
+    <>
+      <AnimatedBackground />
+      <Container>
+        <div className="flex flex-col items-center gap-4">
+          <Spinner text="Loading..." />
+          <a
+            href="/login"
+            className="text-sm text-text-muted hover:text-brand-500 underline underline-offset-4 transition-colors"
+          >
+            Reload
+          </a>
+        </div>
+      </Container>
+    </>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={<LoginFallback />}>
+      <LoginContent />
+    </Suspense>
+  );
+}

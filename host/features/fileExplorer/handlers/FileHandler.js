@@ -1,0 +1,648 @@
+import fs from "fs";
+import path from "path";
+import os from "os";
+import readline from "readline";
+import { execFile, execSync, spawn, spawnSync } from "child_process";
+import chokidar from "chokidar";
+import sharp from "sharp";
+import { IGNORED_DIRS, BINARY_EXTENSIONS, MAX_FILE_SIZE, MAX_MEDIA_SIZE, MAX_IMAGE_RAW_SIZE, MAX_IMAGE_SCALED_SIZE, IMAGE_SCALE_MAX_DIM, MAX_SEARCH_RESULTS, MAX_MATCHES_PER_FILE, MATCH_CONTEXT_CHARS, SEARCH_TIME_BUDGET_MS, SEARCH_YIELD_EVERY, DEFAULT_TREE_DEPTH, MAX_DIR_ENTRIES, MIME_BY_EXT, HEIC_DECODERS, HEIC_DECODE_TIMEOUT_MS, isHeicFile, MAX_WATCHERS, WATCH_BURST_WINDOW_MS, WATCH_BURST_LIMIT, WATCH_BURST_COOLDOWN_MS } from "../constants.js";
+import { CONTROL_RTC_MAX_BYTES } from "../../../lib/transportConstants.js";
+import { isSensitivePath } from "../pathGuard.js";
+
+function isIgnoredDir(name) { return IGNORED_DIRS.includes(name); }
+function isBinaryFile(filename) {
+  return BINARY_EXTENSIONS.includes(path.extname(filename).toLowerCase());
+}
+function getFileType(stat, filename) {
+  if (stat.isDirectory()) return "folder";
+  if (isBinaryFile(filename)) return "binary";
+  return "file";
+}
+function formatSize(bytes) {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+const _cmdCache = new Map();
+function hasCommand(cmd) {
+  if (!_cmdCache.has(cmd)) {
+    const probe = process.platform === "win32" ? "where" : "which";
+    _cmdCache.set(cmd, spawnSync(probe, [cmd], { stdio: "ignore" }).status === 0);
+  }
+  return _cmdCache.get(cmd);
+}
+
+// sharp's prebuilt binaries carry no HEVC decoder, so HEIC/HEIF must go through a
+// system converter first. Writes a temp JPEG, reads it back, cleans up.
+function decodeHeicToJpeg(filePath) {
+  const decoder = HEIC_DECODERS.find((d) => hasCommand(d.cmd));
+  if (!decoder) {
+    throw new Error("HEIC needs a system converter (macOS has sips; on Linux install libheif-examples or imagemagick)");
+  }
+  const out = path.join(os.tmpdir(), `9r-heic-${process.pid}-${Date.now()}.jpg`);
+  try {
+    const res = spawnSync(decoder.cmd, decoder.args(filePath, out), { timeout: HEIC_DECODE_TIMEOUT_MS });
+    if (res.status !== 0 || !fs.existsSync(out)) {
+      throw new Error(`HEIC decode failed (${decoder.cmd}): ${res.stderr?.toString().trim() || "unknown error"}`);
+    }
+    return fs.readFileSync(out);
+  } finally {
+    try { fs.unlinkSync(out); } catch {}
+  }
+}
+
+// Downscale + re-encode an image buffer so the output stays under
+// MAX_IMAGE_SCALED_SIZE. Tries quality steps, then width steps. Never enlarges.
+// filePath is only needed for formats sharp cannot decode itself (HEIC/HEIF).
+// Returns { buffer, width, height, originalWidth, originalHeight }.
+export async function scaleImageBuffer(input, filePath) {
+  const buffer = isHeicFile(filePath) ? decodeHeicToJpeg(filePath) : input;
+  const meta = await sharp(buffer).metadata();
+  // Orientation 5-8 means the stored pixels are rotated 90° from how it displays.
+  const swapped = meta.orientation >= 5;
+  const originalWidth = (swapped ? meta.height : meta.width) || 0;
+  const originalHeight = (swapped ? meta.width : meta.height) || 0;
+  const qualities = [80, 60, 40];
+  const widths = [IMAGE_SCALE_MAX_DIM, 1200, 800];
+  let out = buffer;
+  let outW = originalWidth;
+  let outH = originalHeight;
+  for (const w of widths) {
+    for (const q of qualities) {
+      out = await sharp(buffer)
+        .rotate() // apply EXIF orientation — re-encoding drops the tag itself
+        .resize({ width: w, height: w, fit: "inside", withoutEnlargement: true })
+        .jpeg({ quality: q, mozjpeg: true })
+        .toBuffer();
+      const m = await sharp(out).metadata();
+      outW = m.width || w;
+      outH = m.height || w;
+      if (out.length <= MAX_IMAGE_SCALED_SIZE) return { buffer: out, width: outW, height: outH, originalWidth, originalHeight };
+    }
+  }
+  return { buffer: out, width: outW, height: outH, originalWidth, originalHeight };
+}
+
+function searchFilesRecursive(dir, query, results, maxResults = 50) {
+  if (results.length >= maxResults) return;
+  try {
+    for (const name of fs.readdirSync(dir)) {
+      if (results.length >= maxResults) return;
+      if (name.startsWith(".") || isIgnoredDir(name)) continue;
+      const fullPath = path.join(dir, name);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (stat.isDirectory()) {
+          searchFilesRecursive(fullPath, query, results, maxResults);
+        } else if (name.toLowerCase().includes(query.toLowerCase())) {
+          results.push({ name, path: fullPath, type: isBinaryFile(name) ? "binary" : "file", size: stat.size, sizeFormatted: formatSize(stat.size) });
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+function globToRegex(glob) {
+  if (!glob) return null;
+  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*\*/g, "::ANY::").replace(/\*/g, "[^/]*").replace(/::ANY::/g, ".*").replace(/\?/g, ".");
+  return new RegExp(`^${escaped}$`);
+}
+
+// ripgrep fast path for content search: respects .gitignore (like every editor),
+// streams NDJSON so limits/deadline kill the child instead of buffering 7GB.
+let rgOkCache = null;
+function rgOk() {
+  if (rgOkCache !== null) return Promise.resolve(rgOkCache);
+  return new Promise((resolve) => {
+    execFile("rg", ["--version"], { timeout: 2000 }, (err) => { rgOkCache = !err; resolve(rgOkCache); });
+  });
+}
+
+function searchInFilesRg(workspace, { query, caseSensitive, wholeWord, regex, includeGlob, excludeGlob }) {
+  return new Promise((resolve) => {
+    const args = ["--json", "--hidden", "--max-filesize", "1M", "-m", String(MAX_MATCHES_PER_FILE)];
+    if (!caseSensitive) args.push("-i");
+    if (wholeWord) args.push("-w");
+    args.push("-g", `!{${IGNORED_DIRS.join(",")}}`);
+    if (includeGlob) args.push("-g", includeGlob);
+    if (excludeGlob) args.push("-g", `!${excludeGlob}`);
+    args.push("--", regex ? query : query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), workspace);
+
+    const child = spawn("rg", args, { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    const results = [];
+    let current = null;
+    const killTimer = setTimeout(() => child.kill(), SEARCH_TIME_BUDGET_MS);
+    const finish = () => { clearTimeout(killTimer); resolve(results); };
+
+    const rl = readline.createInterface({ input: child.stdout });
+    rl.on("line", (lineText) => {
+      let ev;
+      try { ev = JSON.parse(lineText); } catch { return; }
+      if (ev.type !== "match" || !ev.data) return;
+      const d = ev.data;
+      const filePath = d.path?.text;
+      const sm = d.submatches?.[0];
+      if (!filePath || sm === undefined || isSensitivePath(filePath)) return;
+      if (!current || current.path !== filePath) {
+        if (results.length >= MAX_SEARCH_RESULTS) { child.kill(); finish(); return; }
+        current = { path: filePath, matches: [] };
+        results.push(current);
+      }
+      const raw = (d.lines?.text || "").replace(/\r?\n$/, "");
+      const start = Math.max(0, sm.start - MATCH_CONTEXT_CHARS);
+      const end = Math.min(raw.length, sm.end + MATCH_CONTEXT_CHARS);
+      current.matches.push({ line: d.line_number, column: sm.start + 1, contextStart: start, lineText: raw.slice(start, end), matchLength: sm.end - sm.start });
+    });
+    // exit 2 = rg error (bad regex, unreadable root) → null lets the JS fallback report it
+    child.on("error", () => { clearTimeout(killTimer); resolve(null); });
+    child.on("close", (code) => {
+      clearTimeout(killTimer);
+      resolve(code === 2 && results.length === 0 ? null : results);
+    });
+  });
+}
+
+// Async + time-budgeted so a huge tree neither freezes the host (yields to the
+// event loop) nor keeps the client waiting forever (returns partial past budget).
+async function searchInFilesRecursive(dir, baseDir, matcher, includeRe, excludeRe, results, scan) {
+  if (results.length >= MAX_SEARCH_RESULTS) return;
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+  for (const entry of entries) {
+    if (results.length >= MAX_SEARCH_RESULTS) return;
+    if (Date.now() > scan.deadline) return;
+    if (++scan.count % SEARCH_YIELD_EVERY === 0) await new Promise((r) => setImmediate(r));
+    if (isIgnoredDir(entry.name)) continue;
+    const fullPath = path.join(dir, entry.name);
+    const rel = path.relative(baseDir, fullPath);
+    if (entry.isDirectory()) {
+      await searchInFilesRecursive(fullPath, baseDir, matcher, includeRe, excludeRe, results, scan);
+      continue;
+    }
+    if (!entry.isFile()) continue;
+    if (isBinaryFile(entry.name)) continue;
+    if (isSensitivePath(fullPath)) continue;
+    if (excludeRe && excludeRe.test(rel)) continue;
+    if (includeRe && !includeRe.test(rel)) continue;
+    try {
+      const stat = fs.statSync(fullPath);
+      if (stat.size > MAX_FILE_SIZE) continue;
+      const content = fs.readFileSync(fullPath, "utf-8");
+      const lines = content.split("\n");
+      const matches = [];
+      for (let i = 0; i < lines.length && matches.length < MAX_MATCHES_PER_FILE; i++) {
+        const line = lines[i];
+        const found = matcher(line);
+        for (const m of found) {
+          if (matches.length >= MAX_MATCHES_PER_FILE) break;
+          const start = Math.max(0, m.column - MATCH_CONTEXT_CHARS);
+          const end = Math.min(line.length, m.column + m.length + MATCH_CONTEXT_CHARS);
+          matches.push({ line: i + 1, column: m.column + 1, contextStart: start, lineText: line.slice(start, end), matchLength: m.length });
+        }
+      }
+      if (matches.length) results.push({ path: fullPath, matches });
+    } catch {}
+  }
+}
+
+function buildFileTree(dir, depth, showHidden) {
+  let entries;
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+  const children = [];
+  for (const entry of entries) {
+    if (!showHidden && entry.name.startsWith(".") && entry.name !== ".env" && entry.name !== ".env.example") continue;
+    const fullPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      const node = { name: entry.name, path: fullPath, type: "folder" };
+      if (depth > 0) node.children = buildFileTree(fullPath, depth - 1, showHidden);
+      children.push(node);
+    } else if (entry.isFile()) {
+      children.push({ name: entry.name, path: fullPath, type: isBinaryFile(entry.name) ? "binary" : "file" });
+    }
+  }
+  children.sort((a, b) => {
+    if (a.type === "folder" && b.type !== "folder") return -1;
+    if (a.type !== "folder" && b.type === "folder") return 1;
+    return a.name.localeCompare(b.name);
+  });
+  return children;
+}
+
+function getWindowsDrives() {
+  if (process.platform !== "win32") return [];
+  try {
+    const result = execSync("wmic logicaldisk get name", { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+    return result.split(/\r?\n/).map(l => l.trim()).filter(l => /^[A-Z]:$/.test(l)).map(d => ({ letter: d[0], path: d + "\\" }));
+  } catch {
+    return "CDEFGHIJ".split("").map(l => `${l}:\\`).filter(p => fs.existsSync(p)).map(p => ({ letter: p[0], path: p }));
+  }
+}
+
+export function setupFileHandlers(socket) {
+  socket.on("getSystemInfo", (callback) => {
+    const platform = process.platform;
+    callback({ success: true, platform, isWindows: platform === "win32", drives: platform === "win32" ? getWindowsDrives() : [], homedir: os.homedir() });
+  });
+
+  socket.on("getFiles", ({ dirPath, showHidden }, callback) => {
+    try {
+      const targetPath = dirPath || os.homedir();
+      const resolvedPath = targetPath.startsWith("~") ? targetPath.replace("~", os.homedir()) : targetPath;
+      if (isSensitivePath(resolvedPath)) return callback({ success: false, error: "Access denied" });
+      if (!fs.existsSync(resolvedPath)) return callback({ success: false, error: "Directory not found" });
+
+      // Read names once (cheap), sort by type+name, then cap before stat-ing —
+      // so huge dirs (node_modules) don't pay stat cost for truncated entries.
+      let entries;
+      try { entries = fs.readdirSync(resolvedPath, { withFileTypes: true }); } catch (e) { return callback({ success: false, error: e.message }); }
+      if (!showHidden) {
+        entries = entries.filter((e) => !(e.name.startsWith(".") && e.name !== ".env" && e.name !== ".env.example"));
+      }
+      entries.sort((a, b) => {
+        const ad = a.isDirectory(), bd = b.isDirectory();
+        if (ad && !bd) return -1;
+        if (!ad && bd) return 1;
+        return a.name.localeCompare(b.name);
+      });
+      const truncated = entries.length > MAX_DIR_ENTRIES;
+      const slice = truncated ? entries.slice(0, MAX_DIR_ENTRIES) : entries;
+
+      const files = [];
+      for (const entry of slice) {
+        try {
+          const fullPath = path.join(resolvedPath, entry.name);
+          const stat = fs.statSync(fullPath);
+          files.push({ name: entry.name, path: fullPath, type: getFileType(stat, entry.name), size: stat.isFile() ? stat.size : null, sizeFormatted: stat.isFile() ? formatSize(stat.size) : null, modified: stat.mtime.getTime() });
+        } catch {}
+      }
+
+      callback({ success: true, files, currentPath: resolvedPath, parentPath: path.dirname(resolvedPath), truncated });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.on("searchFiles", ({ workspace, query }, callback) => {
+    try {
+      if (!query || query.length < 2) return callback({ success: true, files: [] });
+      const resolvedPath = (workspace || os.homedir()).replace(/^~/, os.homedir());
+      if (!fs.existsSync(resolvedPath)) return callback({ success: false, error: "Workspace not found" });
+
+      const results = [];
+      searchFilesRecursive(resolvedPath, query, results, 50);
+      results.sort((a, b) => {
+        const aExact = a.name.toLowerCase() === query.toLowerCase();
+        const bExact = b.name.toLowerCase() === query.toLowerCase();
+        if (aExact && !bExact) return -1;
+        if (!aExact && bExact) return 1;
+        return a.path.length - b.path.length;
+      });
+      callback({ success: true, files: results });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.on("readFile", ({ filePath }, callback) => {
+    try {
+      if (isSensitivePath(filePath)) return callback({ success: false, error: "Access denied" });
+      if (!fs.existsSync(filePath)) return callback({ success: false, error: "File not found" });
+      const stat = fs.statSync(filePath);
+      if (stat.size > MAX_FILE_SIZE) return callback({ success: false, error: `File too large (${formatSize(stat.size)}). Max ${formatSize(MAX_FILE_SIZE)}` });
+      if (isBinaryFile(filePath)) return callback({ success: false, error: "Cannot open binary file" });
+      // RTC control DC caps at CONTROL_RTC_MAX_BYTES — large text must stream via file DC.
+      if (stat.size > CONTROL_RTC_MAX_BYTES) return callback({ success: true, content: "", streamInstead: true, size: stat.size });
+      callback({ success: true, content: fs.readFileSync(filePath, "utf-8") });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  // Previewable media (image/video/audio/pdf) as a data URL. Used by every viewer
+  // so they share one size cap and MIME table. readImage kept as a back-compat alias.
+  socket.on("readMedia", async ({ filePath }, callback) => {
+    try {
+      if (isSensitivePath(filePath)) return callback({ success: false, error: "Access denied" });
+      if (!fs.existsSync(filePath)) return callback({ success: false, error: "File not found" });
+      const stat = fs.statSync(filePath);
+      const ext = path.extname(filePath).toLowerCase().slice(1);
+      const mime = MIME_BY_EXT[ext] || "application/octet-stream";
+      const isImage = mime.startsWith("image/");
+      // Images: generous raw cap (decoded + scaled down). Other media: hard base64 cap.
+      const cap = isImage ? MAX_IMAGE_RAW_SIZE : MAX_MEDIA_SIZE;
+      if (stat.size > cap) return callback({ success: false, error: `File too large (${formatSize(stat.size)}). Max ${formatSize(cap)}` });
+      const buffer = fs.readFileSync(filePath);
+      if (isImage) {
+        const scaled = await scaleImageBuffer(buffer, filePath);
+        const dataUrl = `data:image/jpeg;base64,${scaled.buffer.toString("base64")}`;
+        callback({
+          success: true,
+          dataUrl,
+          size: stat.size,
+          mime,
+          originalSize: stat.size,
+          originalWidth: scaled.originalWidth,
+          originalHeight: scaled.originalHeight,
+          width: scaled.width,
+          height: scaled.height,
+          scaled: scaled.buffer.length < stat.size
+        });
+      } else {
+        const dataUrl = `data:${mime};base64,${buffer.toString("base64")}`;
+        callback({ success: true, dataUrl, size: stat.size, mime });
+      }
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  // readImage: back-compat alias for callers still on the old event name.
+  socket.on("readImage", async ({ filePath }, callback) => {
+    try {
+      if (isSensitivePath(filePath)) return callback({ success: false, error: "Access denied" });
+      if (!fs.existsSync(filePath)) return callback({ success: false, error: "File not found" });
+      const stat = fs.statSync(filePath);
+      if (stat.size > MAX_IMAGE_RAW_SIZE) return callback({ success: false, error: `Image too large (${formatSize(stat.size)}). Max ${formatSize(MAX_IMAGE_RAW_SIZE)}` });
+      const buffer = fs.readFileSync(filePath);
+      const scaled = await scaleImageBuffer(buffer, filePath);
+      const dataUrl = `data:image/jpeg;base64,${scaled.buffer.toString("base64")}`;
+      callback({
+        success: true,
+        dataUrl,
+        size: stat.size,
+        mime: "image/jpeg",
+        originalSize: stat.size,
+        originalWidth: scaled.originalWidth,
+        originalHeight: scaled.originalHeight,
+        width: scaled.width,
+        height: scaled.height,
+        scaled: scaled.buffer.length < stat.size
+      });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.on("writeFile", ({ filePath, content }, callback) => {
+    try {
+      if (isSensitivePath(filePath)) return callback({ success: false, error: "Access denied" });
+      fs.writeFileSync(filePath, content, "utf-8");
+      callback({ success: true });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.on("createItem", ({ itemPath, type }, callback) => {
+    try {
+      if (isSensitivePath(itemPath)) return callback({ success: false, error: "Access denied" });
+      if (fs.existsSync(itemPath)) return callback({ success: false, error: "Item already exists" });
+      type === "folder" ? fs.mkdirSync(itemPath, { recursive: true }) : fs.writeFileSync(itemPath, "", "utf-8");
+      callback({ success: true });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.on("deleteItem", ({ itemPath }, callback) => {
+    try {
+      if (isSensitivePath(itemPath)) return callback({ success: false, error: "Access denied" });
+      if (!fs.existsSync(itemPath)) return callback({ success: false, error: "Item not found" });
+      const stat = fs.statSync(itemPath);
+      stat.isDirectory() ? fs.rmSync(itemPath, { recursive: true }) : fs.unlinkSync(itemPath);
+      callback({ success: true });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.on("copyItem", ({ srcPath, destPath }, callback) => {
+    try {
+      if (isSensitivePath(srcPath) || isSensitivePath(destPath)) return callback({ success: false, error: "Access denied" });
+      if (!fs.existsSync(srcPath)) return callback({ success: false, error: "Item not found" });
+      if (fs.existsSync(destPath)) return callback({ success: false, error: "Target already exists" });
+      // Copying a folder into itself would recurse forever.
+      if (destPath.startsWith(srcPath + "/")) return callback({ success: false, error: "Cannot copy into itself" });
+      fs.cpSync(srcPath, destPath, { recursive: true });
+      callback({ success: true });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.on("renameItem", ({ oldPath, newPath }, callback) => {
+    try {
+      if (isSensitivePath(oldPath) || isSensitivePath(newPath)) return callback({ success: false, error: "Access denied" });
+      if (!fs.existsSync(oldPath)) return callback({ success: false, error: "Item not found" });
+      if (fs.existsSync(newPath)) return callback({ success: false, error: "Target already exists" });
+      fs.renameSync(oldPath, newPath);
+      callback({ success: true });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.on("searchInFiles", async ({ workspace, query, caseSensitive, wholeWord, regex, includeGlob, excludeGlob }, callback) => {
+    try {
+      if (!query) return callback({ success: true, results: [] });
+      const resolvedPath = (workspace || os.homedir()).replace(/^~/, os.homedir());
+      if (!fs.existsSync(resolvedPath)) return callback({ success: false, error: "Workspace not found" });
+
+      // Fast path: ripgrep when installed (gitignore-aware, seconds instead of minutes).
+      if (await rgOk()) {
+        const rgResults = await searchInFilesRg(resolvedPath, { query, caseSensitive, wholeWord, regex, includeGlob, excludeGlob });
+        if (rgResults) return callback({ success: true, results: rgResults });
+      }
+
+      const scanMatcher = (re) => (line) => {
+        const out = []; let m;
+        re.lastIndex = 0;
+        while ((m = re.exec(line)) !== null) {
+          out.push({ column: m.index, length: m[0].length });
+          if (m.index === re.lastIndex) re.lastIndex++;
+        }
+        return out;
+      };
+      let matcher;
+      if (regex) {
+        let re;
+        try { re = new RegExp(query, caseSensitive ? "g" : "gi"); } catch (e) { return callback({ success: false, error: `Invalid regex: ${e.message}` }); }
+        matcher = scanMatcher(re);
+      } else if (wholeWord) {
+        const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        matcher = scanMatcher(new RegExp(`\\b${escaped}\\b`, caseSensitive ? "g" : "gi"));
+      } else {
+        const needle = caseSensitive ? query : query.toLowerCase();
+        matcher = (line) => {
+          const hay = caseSensitive ? line : line.toLowerCase();
+          const out = []; let idx = 0;
+          while ((idx = hay.indexOf(needle, idx)) !== -1) {
+            out.push({ column: idx, length: needle.length });
+            idx += needle.length || 1;
+          }
+          return out;
+        };
+      }
+
+      const includeRe = globToRegex(includeGlob);
+      const excludeRe = globToRegex(excludeGlob);
+      const results = [];
+      const scan = { count: 0, deadline: Date.now() + SEARCH_TIME_BUDGET_MS };
+      await searchInFilesRecursive(resolvedPath, resolvedPath, matcher, includeRe, excludeRe, results, scan);
+      callback({ success: true, results });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.on("replaceInFiles", ({ workspace, query, replacement, caseSensitive, regex, files }, callback) => {
+    try {
+      if (!query || !Array.isArray(files) || !files.length) return callback({ success: true, replacedCount: 0, fileCount: 0 });
+
+      let replaceFn;
+      if (regex) {
+        let re;
+        try { re = new RegExp(query, caseSensitive ? "g" : "gi"); } catch (e) { return callback({ success: false, error: `Invalid regex: ${e.message}` }); }
+        replaceFn = (content) => {
+          let count = 0;
+          const next = content.replace(re, (m) => { count++; return replacement; });
+          return { next, count };
+        };
+      } else {
+        replaceFn = (content) => {
+          let count = 0;
+          const flags = caseSensitive ? "g" : "gi";
+          const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+          const re = new RegExp(escaped, flags);
+          const next = content.replace(re, () => { count++; return replacement; });
+          return { next, count };
+        };
+      }
+
+      let replacedCount = 0, fileCount = 0;
+      for (const filePath of files) {
+        try {
+          if (!fs.existsSync(filePath)) continue;
+          if (isBinaryFile(filePath)) continue;
+          if (isSensitivePath(filePath)) continue;
+          const stat = fs.statSync(filePath);
+          if (!stat.isFile() || stat.size > MAX_FILE_SIZE) continue;
+          const content = fs.readFileSync(filePath, "utf-8");
+          const { next, count } = replaceFn(content);
+          if (count > 0) {
+            fs.writeFileSync(filePath, next, "utf-8");
+            replacedCount += count;
+            fileCount++;
+          }
+        } catch {}
+      }
+      callback({ success: true, replacedCount, fileCount });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  // Ref-counted per path: multiple panes share one chokidar watcher; closed only when last unwatches
+  const watchers = new Map();
+
+  socket.on("watchDir", ({ dirPath }, callback) => {
+    try {
+      if (!dirPath || !fs.existsSync(dirPath)) return callback({ success: false, error: "Directory not found" });
+      const existing = watchers.get(dirPath);
+      if (existing) { existing.count++; return callback({ success: true }); }
+      // The client drops its oldest watch when it hits its own cap; refusing here is the
+      // backstop for a client that does not, and it must not read as an error.
+      if (watchers.size >= MAX_WATCHERS) return callback({ success: true, watching: false });
+      const w = chokidar.watch(dirPath, { depth: 0, ignoreInitial: true, persistent: true, ignored: (p) => IGNORED_DIRS.includes(path.basename(p)) });
+      const entry = { w, count: 1, burstStart: 0, burstCount: 0, mutedUntil: 0 };
+      // A directory being written into by a build or an install produces thousands of
+      // events a second. Past the burst limit the path goes quiet and sends one "flooded"
+      // event: the client reloads that directory once instead of once per file.
+      const emit = (type) => (p) => {
+        const now = Date.now();
+        if (now < entry.mutedUntil) return;
+        if (now - entry.burstStart > WATCH_BURST_WINDOW_MS) { entry.burstStart = now; entry.burstCount = 0; }
+        if (++entry.burstCount > WATCH_BURST_LIMIT) {
+          entry.mutedUntil = now + WATCH_BURST_COOLDOWN_MS;
+          return socket.emit("fileChange", { type: "flooded", path: dirPath });
+        }
+        socket.emit("fileChange", { type, path: p });
+      };
+      w.on("add", emit("add")).on("change", emit("change")).on("unlink", emit("unlink")).on("addDir", emit("addDir")).on("unlinkDir", emit("unlinkDir"));
+      watchers.set(dirPath, entry);
+      callback({ success: true, watching: true });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.on("unwatchDir", ({ dirPath }, callback) => {
+    try {
+      const entry = watchers.get(dirPath);
+      if (entry && --entry.count <= 0) { entry.w.close(); watchers.delete(dirPath); }
+      callback({ success: true });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.once("disconnect", () => {
+    for (const { w } of watchers.values()) { try { w.close(); } catch {} }
+    watchers.clear();
+  });
+
+  socket.on("revealInOS", ({ filePath }, callback) => {
+    try {
+      if (!filePath) return callback({ success: false, error: "No path" });
+      const platform = process.platform;
+      let cmd, args;
+      if (platform === "darwin") { cmd = "open"; args = ["-R", filePath]; }
+      else if (platform === "win32") { cmd = "explorer"; args = [`/select,${filePath}`]; }
+      else { cmd = "xdg-open"; args = [path.dirname(filePath)]; }
+      const child = spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true });
+      child.on("error", (e) => callback({ success: false, error: e.message }));
+      child.unref();
+      callback({ success: true });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.on("openInTerminal", ({ dirPath }, callback) => {
+    try {
+      if (!dirPath || !fs.existsSync(dirPath)) return callback({ success: false, error: "Directory not found" });
+      const platform = process.platform;
+      let cmd, args, opts = { detached: true, stdio: "ignore", windowsHide: true };
+      if (platform === "darwin") { cmd = "open"; args = ["-a", "Terminal", dirPath]; }
+      else if (platform === "win32") { cmd = "cmd"; args = ["/C", "start", "\"f3mote\"", "cmd", "/K"]; opts.shell = false; opts.cwd = dirPath; }
+      else { cmd = "gnome-terminal"; args = ["--working-directory", dirPath]; }
+      const child = spawn(cmd, args, opts);
+      child.on("error", () => {
+        if (platform === "linux") {
+          const fb = spawn("xterm", ["-e", "bash"], { ...opts, cwd: dirPath });
+          fb.on("error", (e) => callback({ success: false, error: e.message }));
+          fb.unref();
+        } else {
+          callback({ success: false, error: "Failed to open terminal" });
+        }
+      });
+      child.unref();
+      callback({ success: true });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+
+  socket.on("getFileTree", ({ dirPath, depth, showHidden }, callback) => {
+    try {
+      const resolvedPath = (dirPath || os.homedir()).replace(/^~/, os.homedir());
+      if (!fs.existsSync(resolvedPath)) return callback({ success: false, error: "Directory not found" });
+      const d = typeof depth === "number" ? depth : DEFAULT_TREE_DEPTH;
+      const children = buildFileTree(resolvedPath, d, !!showHidden);
+      callback({ success: true, tree: { name: path.basename(resolvedPath) || resolvedPath, path: resolvedPath, type: "folder", children } });
+    } catch (error) {
+      callback({ success: false, error: error.message });
+    }
+  });
+}

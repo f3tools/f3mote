@@ -1,0 +1,682 @@
+"use client";
+
+import React, { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import {
+  TERMINAL_KEY_POOL,
+  TERMINAL_DEFAULT_BASIC,
+  TERMINAL_DEFAULT_EXTRA,
+  TERMINAL_PINNED_KEY_ID,
+  BUTTON_STYLES,
+  COMMON_COMMANDS,
+  CLIPBOARD_ATTACH_GAP,
+  INPUT_CONTROL_KEYS,
+  INPUT_ENTER_DELAY,
+  INPUT_MAX_HEIGHT_MOBILE,
+  INPUT_MAX_HEIGHT_DESKTOP
+} from "@/features/terminal/constants/terminalConfig";
+import { vibrate } from "@/shared/utils/vibration";
+import { Paperclip, Settings, MoreHorizontal, X, CornerDownLeft, Mic, MicOff, History } from "@/shared/components/ui/Icon";
+import CommandHistoryModal from "@/shared/components/ui/CommandHistoryModal";
+import CommandSuggestions, { pickCommandItems } from "@/shared/components/ui/CommandSuggestions";
+import { useTerminalHistoryStore } from "@/shared/stores/historyStore";
+import { useVoiceInput, localeToSpeechLang, useVoiceLang } from "@/shared/hooks/useVoiceInput";
+import { useInputMode } from "@/shared/hooks/useInputMode";
+import { useCustomKeys } from "@/shared/hooks/useCustomKeys";
+import KeyCustomizeModal from "@/shared/components/ui/KeyCustomizeModal";
+import { useI18n } from "@/shared/i18n";
+import { useTerminalStore } from "@/shared/stores/terminalStore";
+import { useFileBus } from "@/features/fileExplorer/hooks/useFileBus";
+import { useAttachments } from "@/features/terminal/hooks/useAttachments";
+import { generateCombination as generateCombo } from "@/features/terminal/lib/keyCombination";
+import PathSuggestion from "@/shared/components/ui/PathSuggestion";
+import VoicePill from "@/shared/components/ui/VoicePill";
+import { makeDirCache, parsePathInput, pickMatches } from "@/features/terminal/utils/pathSuggest";
+import { PATH_SUGGEST } from "@/features/terminal/constants/terminalConfig";
+import { isMac } from "@/features/terminal/constants/shortcuts";
+
+const MobileKeyboard = ({ bus, sessionId, onExpandChange, onRefocus, onRegisterTextApi, platform, onInput, onSwitchSession, onSwitchToIndex, onInputFocusChange, statusStrip = null, isDesktop = false }) => {
+  const { t, locale } = useI18n();
+  const [isExpanded, setIsExpanded] = useState(false);
+  // True only when the OS soft keyboard actually covers the screen (viewport shrinks) —
+  // input focus alone is not proof: a Bluetooth keyboard keeps focus with no keyboard shown
+  const [kbOpen, setKbOpen] = useState(false);
+  useEffect(() => {
+    const vv = window.visualViewport;
+    if (!vv) return;
+    const onResize = () => setKbOpen(window.innerHeight - vv.height > 150);
+    vv.addEventListener("resize", onResize);
+    onResize();
+    return () => vv.removeEventListener("resize", onResize);
+  }, []);
+  // Draft text lives in the store keyed by sessionId so it survives this component
+  // unmounting (e.g. switching to remote view and back).
+  const textInput = useTerminalStore((s) => s.drafts[sessionId] ?? "");
+  const setDraft = useTerminalStore((s) => s.setDraft);
+  const setTextInput = useCallback((v) => {
+    setDraft(sessionId, typeof v === "function" ? v(useTerminalStore.getState().drafts[sessionId] ?? "") : v);
+  }, [setDraft, sessionId]);
+  const [isMobile, setIsMobile] = useState(false);
+  const [showPasteInput, setShowPasteInput] = useState(false);
+  const [showCustomize, setShowCustomize] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const addCommand = useTerminalHistoryStore((s) => s.addCommand);
+  const resolveAlias = useTerminalHistoryStore((s) => s.resolveAlias);
+  const history = useTerminalHistoryStore((s) => s.history);
+  const pinned = useTerminalHistoryStore((s) => s.pinned);
+  const textInputRef = useRef(null);
+  const pasteInputRef = useRef(null);
+  const isSendingRef = useRef(false);
+  // Physical ArrowUp/Down navigate command history; -1 = editing live draft.
+  const historyIndexRef = useRef(-1);
+  const draftRef = useRef("");
+
+  // Path-aware ghost suggestion: only resolves when input matches a path-verb
+  // regex + caret at end. Dir listings cached client-side (TTL, FIFO cap).
+  const cwd = useTerminalStore((s) => s.cwdBySession[sessionId]);
+  const [pathItems, setPathItems] = useState([]);
+  // Keyboard-highlighted row in each suggest dropdown (-1 = none). Tab cycles,
+  // Enter selects; bare Tab falls through to session switch when no suggest is open.
+  const [pathActive, setPathActive] = useState(-1);
+  const [cmdActive, setCmdActive] = useState(-1);
+  // Same ranked list CommandSuggestions renders, lifted here so Tab can cycle it.
+  // Empty while path-suggest is open (mirrors the component's `disabled` prop) so the
+  // two dropdowns never compete for the same Tab.
+  const cmdItems = useMemo(
+    () => (pathItems.length > 0 ? [] : pickCommandItems(textInput, history, pinned, COMMON_COMMANDS, isMobile)),
+    [textInput, history, pinned, isMobile, pathItems]
+  );
+  // Clamp highlight into range as the list shrinks (derived — avoids a reset effect).
+  // -1 stays -1 (nothing selected yet); otherwise modular-wrap into range.
+  const wrap = (i, len) => (i < 0 || !len ? -1 : ((i % len) + len) % len);
+  const pathActiveClamped = wrap(pathActive, pathItems.length);
+  const cmdActiveClamped = wrap(cmdActive, cmdItems.length);
+  const dirCacheRef = useRef(null);
+  if (dirCacheRef.current == null) dirCacheRef.current = makeDirCache();
+  const busRef = useRef(bus);
+  useEffect(() => { busRef.current = bus; }, [bus]);
+  const fileBus = useFileBus(busRef);
+  // Pending attachments (images/files) shown as chips; sent via OS clipboard on send.
+  const {
+    attachments, setAttachments,
+    addFiles, removeAttachment, sendOneAttachment, handleFileUpload, handleAttachPaste
+  } = useAttachments({ bus, sessionId });
+
+  // Voice dictation language: persisted, defaults to the UI locale. Chosen via modal.
+  const [voiceLang] = useVoiceLang(locale);
+  const voice = useVoiceInput({
+    lang: localeToSpeechLang(voiceLang),
+    onText: (txt) => {
+      setTextInput(txt);
+      const el = textInputRef.current;
+      if (el) requestAnimationFrame(() => {
+        try { el.selectionStart = el.selectionEnd = el.value.length; } catch {}
+        el.scrollTop = el.scrollHeight;
+      });
+    },
+  });
+  const inputMode = useInputMode();
+  // PC/laptop with physical keyboard → hide virtual key toolbar.
+  const hasPhysicalKeyboard = inputMode === "mouse";
+  // Auto-grow textarea from 1 row up to a max, then scroll internally.
+  // Desktop gets a taller cap so long pastes/edits stay readable.
+  useEffect(() => {
+    const el = textInputRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    const maxHeight = hasPhysicalKeyboard ? INPUT_MAX_HEIGHT_DESKTOP : INPUT_MAX_HEIGHT_MOBILE;
+    el.style.height = `${Math.min(el.scrollHeight, maxHeight)}px`;
+  }, [textInput, hasPhysicalKeyboard]);
+  const toggleVoice = () => {
+    if (voice.listening) { voice.stop(); return; }
+    document.activeElement?.blur(); // hide soft keyboard while dictating
+    voice.start(textInput);
+  };
+
+  // Recompute ghost suffix when text or cwd changes. Only queries host if input
+  // parses to a path-verb arg form; otherwise clears. State is set only from the
+  // debounced async callback (never synchronously in the effect body).
+  const lastSuggestRef = useRef(0);
+  useEffect(() => {
+    const parsed = parsePathInput(textInput, cwd);
+    const token = ++lastSuggestRef.current;
+    const timer = setTimeout(async () => {
+      if (token !== lastSuggestRef.current) return;
+      if (!parsed) { setPathItems([]); return; }
+      const now = Date.now();
+      let entries = dirCacheRef.current.get(parsed.dir, now);
+      if (entries == null) {
+        const res = await fileBus.getFiles(parsed.dir, false);
+        if (token !== lastSuggestRef.current) return;
+        if (!res?.success) { setPathItems([]); return; }
+        entries = res.files;
+        dirCacheRef.current.set(parsed.dir, entries, now);
+      }
+      setPathItems(pickMatches(entries, parsed.prefix, parsed));
+    }, PATH_SUGGEST.debounceMs);
+    return () => clearTimeout(timer);
+  }, [textInput, cwd, fileBus]);
+
+  // Reset per-session cache + suggestions when switching panes.
+  useEffect(() => {
+    const timer = setTimeout(() => { dirCacheRef.current?.clear(); setPathItems([]); }, 0);
+    return () => clearTimeout(timer);
+  }, [sessionId]);
+
+
+  const [ctrlPressed, setCtrlPressed] = useState(false);
+  const [metaPressed, setMetaPressed] = useState(false);
+  const [altPressed, setAltPressed] = useState(false);
+  const [shiftPressed, setShiftPressed] = useState(false);
+
+  // Legacy basic-bar default (pre-slash) → auto-upgrade unchanged configs.
+  const basicCustom = useCustomKeys("terminal.basicKeys", TERMINAL_KEY_POOL, TERMINAL_DEFAULT_BASIC, "flat", [
+    ["esc", "up", "down", "ctrlC", "ctrl", "opt", "shift", "tab"]
+  ]);
+  const extraCustom = useCustomKeys("terminal.extraKeys", TERMINAL_KEY_POOL, TERMINAL_DEFAULT_EXTRA, "grid");
+
+  // Smart combination generator — pure encoder in lib/keyCombination.
+  const generateCombination = useCallback((key, modifiers = {}) => generateCombo(key, {
+    ctrl: modifiers.ctrl || ctrlPressed,
+    alt: modifiers.alt || altPressed,
+    shift: modifiers.shift || shiftPressed
+  }), [ctrlPressed, altPressed, shiftPressed]);
+
+  useEffect(() => {
+    const checkMobile = () => {
+      const mobile = window.innerWidth < 768 ||
+        ("ontouchstart" in window) ||
+        (navigator.maxTouchPoints > 0);
+      setIsMobile(mobile);
+    };
+    checkMobile();
+    window.addEventListener("resize", checkMobile);
+    return () => window.removeEventListener("resize", checkMobile);
+  }, []);
+
+  useEffect(() => {
+    if (onExpandChange) onExpandChange(true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasPhysicalKeyboard]);
+
+  // Expose openTextPanel for paste-fallback from TerminalPane
+  useEffect(() => {
+    if (!onRegisterTextApi) return;
+    const openTextPanel = () => {
+      setTimeout(() => textInputRef.current?.focus(), 100);
+    };
+    const focus = () => { textInputRef.current?.focus({ preventScroll: true }); };
+    onRegisterTextApi({ openTextPanel, focus });
+    return () => onRegisterTextApi(null);
+  }, [onRegisterTextApi]);
+
+  // Paste on mobile: skip navigator.clipboard.readText() (triggers clipboard-read
+  // permission prompt) — go straight to the paste input field where the native
+  // paste menu fills e.clipboardData (no permission needed).
+  const openPasteInput = useCallback(() => {
+    setShowPasteInput(true);
+    setTimeout(() => pasteInputRef.current?.focus(), 100);
+  }, []);
+
+  // Intercept keyboard input when modifiers are active
+  useEffect(() => {
+    if (!isMobile || !bus || !sessionId) return;
+    const hasActiveModifier = ctrlPressed || metaPressed || altPressed || shiftPressed;
+    if (!hasActiveModifier) return;
+
+    const handleKeyDown = async (e) => {
+      if (!ctrlPressed && !metaPressed && !altPressed && !shiftPressed) return;
+      if (["Control", "Alt", "Shift", "Meta"].includes(e.key)) return;
+      e.preventDefault();
+      e.stopPropagation();
+      let key = e.key;
+
+      if ((ctrlPressed || metaPressed) && key.toLowerCase() === "v") {
+        openPasteInput();
+        setCtrlPressed(false); setMetaPressed(false); setAltPressed(false); setShiftPressed(false);
+        return;
+      }
+
+      if (key === "Backspace") key = "Backspace";
+      else if (key === "Enter") key = "Enter";
+      else if (key === "Tab") key = "Tab";
+      else if (key === "Escape") key = "Escape";
+      else if (key === "Delete") key = "Delete";
+      else if (key.startsWith("Arrow")) key = e.key;
+      else if (key.startsWith("F") && key.length <= 3) key = e.key;
+
+      const data = generateCombination(key, {
+        ctrl: ctrlPressed, alt: altPressed, shift: shiftPressed, meta: metaPressed
+      });
+      onInput?.(sessionId);
+      bus.emit("input", { sessionId, data });
+      setCtrlPressed(false); setMetaPressed(false); setAltPressed(false); setShiftPressed(false);
+    };
+
+    document.addEventListener("keydown", handleKeyDown, true);
+    return () => document.removeEventListener("keydown", handleKeyDown, true);
+  }, [isMobile, bus, sessionId, ctrlPressed, metaPressed, altPressed, shiftPressed, generateCombination, openPasteInput]);
+
+  if ((!isMobile && !hasPhysicalKeyboard) || !bus || !sessionId) return null;
+
+  const handleModifierToggle = (modifier) => {
+    vibrate();
+    if (modifier === "Ctrl") setCtrlPressed(!ctrlPressed);
+    else if (modifier === "Meta") setMetaPressed(!metaPressed);
+    else if (modifier === "Alt" || modifier === "Opt") setAltPressed(!altPressed);
+    else if (modifier === "Shift") setShiftPressed(!shiftPressed);
+  };
+
+  const handlePasteInput = (e) => {
+    e.preventDefault();
+    const text = e.clipboardData?.getData("text");
+    if (text && bus) {
+      onInput?.(sessionId);
+      bus.emit("input", { sessionId, data: text });
+      vibrate();
+    }
+    setShowPasteInput(false);
+  };
+
+  const sendKey = async (key, forceModifiers = {}) => {
+    vibrate();
+    const ctrl = forceModifiers.ctrl || ctrlPressed;
+    const meta = forceModifiers.meta || metaPressed;
+    if ((ctrl || meta) && key.toLowerCase() === "v") {
+      openPasteInput();
+      setCtrlPressed(false); setMetaPressed(false); setAltPressed(false); setShiftPressed(false);
+      return;
+    }
+    const data = generateCombination(key, forceModifiers);
+    onInput?.(sessionId);
+    bus.emit("input", { sessionId, data });
+    if (key !== "Ctrl" && key !== "Meta" && key !== "Alt" && key !== "Shift") {
+      setCtrlPressed(false); setMetaPressed(false); setAltPressed(false); setShiftPressed(false);
+    }
+  };
+
+  const toggleExpanded = () => {
+    vibrate();
+    const newState = !isExpanded;
+    setIsExpanded(newState);
+    if (newState) document.activeElement?.blur();
+    if (onExpandChange) setTimeout(() => onExpandChange(newState), 320);
+  };
+
+  // Read a File → base64 attachment entry, skipping oversized ones.
+  const sendTextBatch = async () => {
+    if (isSendingRef.current) return;
+    isSendingRef.current = true;
+    vibrate(15);
+    if (voice.listening) voice.stop();
+    if (!bus || !sessionId) {
+      isSendingRef.current = false;
+      return;
+    }
+    // Only pull the keyboard back up if the input was already focused when sending.
+    const wasFocused = document.activeElement === textInputRef.current;
+    // Blur to force-commit pending IME composition before reading value,
+    // otherwise the last composed char may be missing → inconsistent sends.
+    if (wasFocused) textInputRef.current?.blur();
+    const raw = textInputRef.current?.value ?? textInput;
+    // Clear DOM and state immediately to prevent duplicate sends from rapid keydowns/blurs
+    if (textInputRef.current) textInputRef.current.value = "";
+    setTextInput("");
+    historyIndexRef.current = -1;
+
+    // Expand a bare snippet alias (e.g. "nrd" -> "npm run dev") before sending.
+    const text = resolveAlias(raw);
+    onInput?.(sessionId);
+
+    // Attachments first (serially), then text — mirrors paste-image-then-type on the host.
+    const pending = attachments;
+    if (pending.length) setAttachments([]);
+    for (const att of pending) {
+      await sendOneAttachment(att);
+      await new Promise((r) => setTimeout(r, CLIPBOARD_ATTACH_GAP));
+    }
+
+    if (text === "") {
+      if (!pending.length) bus.emit("input", { sessionId, data: "\r" });
+    } else {
+      // Send text first, then Enter after a short delay so PTY reliably
+      // receives both (mobile/IME may otherwise drop the Enter).
+      bus.emit("input", { sessionId, data: text });
+      setTimeout(() => bus.emit("input", { sessionId, data: "\r" }), INPUT_ENTER_DELAY);
+      addCommand(text);
+    }
+    if (wasFocused) textInputRef.current?.focus();
+    setTimeout(() => { isSendingRef.current = false; }, 150);
+  };
+
+  const buttonBaseClass = BUTTON_STYLES.base;
+  const normalButtonClass = `${buttonBaseClass} ${BUTTON_STYLES.normal}`;
+  const arrowButtonClass = `${buttonBaseClass} ${BUTTON_STYLES.arrow}`;
+
+  const getModifierActive = (id) => (
+    (id === "ctrl" && ctrlPressed) ||
+    (id === "meta" && metaPressed) ||
+    (id === "opt" && altPressed) ||
+    (id === "shift" && shiftPressed)
+  );
+
+  // Render one key from pool entry. `large=true` → auto-width + taller (extra panel).
+  const renderKey = (kc, idx, large = false, pinned = false) => {
+    const isModifierActive = kc.type === "modifier" && getModifierActive(kc.id);
+    const cls = isModifierActive
+      ? `${buttonBaseClass} ${BUTTON_STYLES.modifierActive}`
+      : pinned ? `${buttonBaseClass} ${BUTTON_STYLES.pinned}`
+      : kc.type === "arrow" ? arrowButtonClass : normalButtonClass;
+    const accent = kc.type === "ctrl" ? "text-brand-400" : "";
+    const textCls = kc.label.length > 1 ? BUTTON_STYLES.textSmall : BUTTON_STYLES.textNormal;
+    const sizeStyle = large ? BUTTON_STYLES.sizeLarge : BUTTON_STYLES.size;
+
+    return (
+      <button
+        key={kc.id + idx}
+        onMouseDown={(e) => e.preventDefault()}
+        onClick={() => {
+          if (kc.type === "modifier") handleModifierToggle(kc.key);
+          else if (kc.type === "ctrl") sendKey(kc.key, { ctrl: true });
+          else sendKey(kc.key);
+        }}
+        className={`${cls} ${accent} ${textCls} whitespace-nowrap`}
+        style={sizeStyle}
+      >
+        {kc.label}
+      </button>
+    );
+  };
+
+  // The strip stays until the OS keyboard actually takes the space — visualViewport
+  // shrink is the real signal, unlike focus which can exist without any keyboard
+  const stripVisible = !!statusStrip && !isExpanded && !kbOpen && !hasPhysicalKeyboard;
+
+  return (
+    <div className="flex flex-col w-full">
+      {/* Paste Input Fallback */}
+      {showPasteInput && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-[2px] flex items-center justify-center z-[60]" onClick={() => setShowPasteInput(false)}>
+          <input
+            ref={pasteInputRef}
+            placeholder={t("mobileKeyboard.pasteHere")}
+            onPaste={handlePasteInput}
+            onClick={(e) => e.stopPropagation()}
+            className="px-6 py-3 bg-surface-2 text-text rounded-brand focus:ring-2 focus:ring-brand-500/40 font-medium transition-all duration-150 ease-out outline-none text-center w-64"
+          />
+        </div>
+      )}
+
+      {/* Expanded keyboard panel — 3 scrollable rows */}
+      <div
+        className={`transition-all duration-300 overflow-hidden bg-bg ${isExpanded && !hasPhysicalKeyboard ? "max-h-64 opacity-100" : "max-h-0 opacity-0"}`}
+      >
+        <div className="p-2 max-w-2xl mx-auto">
+          <div className="space-y-1">
+            {extraCustom.rows.map((row, rIdx) => (
+              <div key={rIdx} className="flex items-center gap-1.5">
+                <div className="flex-1 min-w-0 flex gap-1.5 overflow-x-auto scroll-thin-x pr-3 rounded-lg">
+                  {row.map((id, cIdx) => {
+                    const kc = TERMINAL_KEY_POOL.find(p => p.id === id);
+                    return kc ? renderKey(kc, rIdx * 100 + cIdx, true) : null;
+                  })}
+                </div>
+                {rIdx === 0 && (
+                  <button
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={() => { vibrate(); setShowCustomize(true); }}
+                    className="shrink-0 h-8 w-8 flex items-center justify-center text-text-muted hover:text-text bg-surface-2 hover:bg-surface-3 rounded-brand transition-all duration-150 ease-out"
+                    title={t("remote.customizeKeys")}
+                  >
+                    <Settings size={16} />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Status strip takes the row above the input only while the OS keyboard is closed.
+          When visible, it supplies the top spacing — the input panel drops its own. */}
+      {stripVisible && statusStrip}
+
+      {/* Text Input Panel */}
+      <div
+        className="relative transition-all duration-300 overflow-visible opacity-100 flex-shrink-0"
+      >
+        <VoicePill
+          voice={voice}
+          className={`absolute left-1/2 -translate-x-1/2 z-30 ${stripVisible ? "bottom-[calc(100%+36px)]" : "bottom-[calc(100%+18px)]"}`}
+        />
+        <div className={isDesktop ? "flex w-full items-stretch" : `${stripVisible ? "pt-0.5" : "pt-2"} px-2 pb-2 flex gap-2 items-end`}>
+          <div className={`relative flex-1 bg-surface-2 transition-all duration-150 ease-out input-focus-glow border-border-subtle ${
+            isDesktop ? "rounded-none border-0 border-r" : "rounded-xl border"
+          }`}>
+            <PathSuggestion
+              items={pathItems}
+              activeIndex={pathActiveClamped}
+              onSelect={(full) => { setTextInput(full); textInputRef.current?.focus(); }}
+            />
+            <CommandSuggestions
+              value={textInput}
+              store={useTerminalHistoryStore}
+              commonCommands={COMMON_COMMANDS}
+              isMobile={isMobile}
+              disabled={pathItems.length > 0}
+              activeIndex={cmdActiveClamped}
+              onSelect={(cmd) => { setTextInput(cmd); textInputRef.current?.focus(); }}
+            />
+            {attachments.length > 0 && (
+              <div className="flex gap-2 px-2 pt-2 overflow-x-auto scroll-thin-x">
+                {attachments.map((att) => (
+                  <div key={att.id} className="relative flex-shrink-0 group">
+                    {att.isImage ? (
+                      <img src={`data:${att.type};base64,${att.content}`} alt={att.name}
+                        className="w-10 h-10 object-cover rounded border border-border" />
+                    ) : (
+                      <div className="w-10 h-10 flex flex-col items-center justify-center rounded border border-border bg-surface-3 px-1">
+                        <Paperclip size={14} className="text-text-muted" />
+                        <span className="text-[9px] text-text-muted truncate w-full text-center">{att.name}</span>
+                      </div>
+                    )}
+                    <button
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => removeAttachment(att.id)}
+                      className="absolute -top-1.5 -right-1.5 w-4 h-4 flex items-center justify-center bg-surface-3 rounded-full text-text-muted hover:text-text border border-border"
+                    >
+                      <X size={10} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <label className="absolute left-1.5 top-1/2 -translate-y-1/2 w-6 h-6 flex items-center justify-center cursor-pointer text-orange-500/70 hover:text-orange-500 transition-colors touch-none">
+              <Paperclip size={16} />
+              <input type="file" multiple onChange={handleFileUpload} className="hidden" accept="*/*" />
+            </label>
+            <textarea
+              ref={textInputRef}
+              value={textInput}
+              onChange={(e) => {
+                setTextInput(e.target.value);
+                historyIndexRef.current = -1;
+              }}
+              onFocus={(e) => {
+                const len = e.target.value.length;
+                e.target.selectionStart = e.target.selectionEnd = len;
+                onInputFocusChange?.(true);
+              }}
+              onBlur={() => onInputFocusChange?.(false)}
+              onPaste={handleAttachPaste}
+              onKeyDown={(e) => {
+                if (hasPhysicalKeyboard && e.key === "Tab") {
+                  if (!e.ctrlKey && !e.altKey && !e.metaKey) {
+                    if (pathItems.length > 0) {
+                      e.preventDefault();
+                      const step = e.shiftKey ? -1 : 1;
+                      setPathActive((i) => (pathItems.length ? (((i + step) % pathItems.length) + pathItems.length) % pathItems.length : -1));
+                      return;
+                    }
+                    if (cmdItems.length > 0) {
+                      e.preventDefault();
+                      const step = e.shiftKey ? -1 : 1;
+                      setCmdActive((i) => (cmdItems.length ? (((i + step) % cmdItems.length) + cmdItems.length) % cmdItems.length : -1));
+                      return;
+                    }
+                  }
+                  e.preventDefault();
+                  const data = generateCombination("Tab", { ctrl: e.ctrlKey, alt: e.altKey, shift: e.shiftKey, meta: e.metaKey });
+                  onInput?.(sessionId);
+                  bus.emit("input", { sessionId, data });
+                  return;
+                }
+                const isDigit = /^Digit([1-9])$/.exec(e.code) || (/^[1-9]$/.exec(e.key));
+                if (hasPhysicalKeyboard && ((isMac() ? (e.altKey && !e.ctrlKey && !e.metaKey) : (e.ctrlKey || e.metaKey)) && isDigit)) {
+                  e.preventDefault();
+                  onSwitchToIndex?.(Number(isDigit[1]) - 1);
+                  return;
+                }
+                if (hasPhysicalKeyboard && e.key === "Enter" && !e.shiftKey) {
+                  // Do not submit while composing (macOS/Safari IME committing candidate via Enter)
+                  if (e.nativeEvent?.isComposing || e.isComposing || e.keyCode === 229) return;
+                  // Accept a keyboard-highlighted suggestion instead of sending.
+                  if (pathItems.length > 0 && pathActiveClamped >= 0) {
+                    e.preventDefault();
+                    setTextInput(pathItems[pathActiveClamped].full);
+                    setPathActive(-1);
+                    textInputRef.current?.focus();
+                    return;
+                  }
+                  if (cmdItems.length > 0 && cmdActiveClamped >= 0) {
+                    e.preventDefault();
+                    setTextInput(cmdItems[cmdActiveClamped].cmd);
+                    setCmdActive(-1);
+                    textInputRef.current?.focus();
+                    return;
+                  }
+                  e.preventDefault();
+                  sendTextBatch();
+                  return;
+                }
+                // Empty input → forward arrow to terminal (shell history walk);
+                // non-empty → caret moves within the textarea normally.
+                if (hasPhysicalKeyboard && (e.key === "ArrowUp" || e.key === "ArrowDown")
+                    && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey
+                    && !textInput) {
+                  e.preventDefault();
+                  onInput?.(sessionId);
+                  bus.emit("input", { sessionId, data: e.key === "ArrowUp" ? "\x1b[A" : "\x1b[B" });
+                  return;
+                }
+                // Control keys (Esc, Ctrl+C/D/Z/L) → straight to terminal.
+                const cfg = INPUT_CONTROL_KEYS[e.key];
+                if (cfg && (!cfg.ctrl || e.ctrlKey) && !e.metaKey && !e.altKey) {
+                  const el = e.target;
+                  if (cfg.requireNoSelection && el.selectionStart !== el.selectionEnd) return;
+                  e.preventDefault();
+                  onInput?.(sessionId);
+                  bus.emit("input", { sessionId, data: cfg.data });
+                }
+              }}
+              placeholder={hasPhysicalKeyboard ? (isMac() ? "Opt ←/→ · Opt 1…9 to switch tab" : "Ctrl+Shift+←/→ · 1…9 to switch tab") : t("mobileKeyboard.typeCommand")}
+              rows={1}
+              className="block w-full pl-9 pr-16 py-2 bg-transparent text-text text-sm placeholder-text-muted placeholder:text-[11px] placeholder:leading-[20px] focus:outline-none resize-none overflow-y-auto touch-none"
+            />
+            {textInput ? (
+              <button
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => { setTextInput(""); textInputRef.current?.focus(); }}
+                title={t("voice.clear")}
+                className="absolute right-10 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center text-text-muted hover:text-text transition-colors touch-none"
+              >
+                <X size={14} />
+              </button>
+            ) : (
+              <button
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={() => setShowHistory(true)}
+                title={t("history.title")}
+                className="absolute right-10 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center text-text-muted hover:text-text transition-colors touch-none"
+              >
+                <History size={14} />
+              </button>
+            )}
+            {voice.active && (
+              <button
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={toggleVoice}
+                title={voice.error === "not-allowed" || voice.error === "service-not-allowed" ? t("voice.denied") : t("voice.dictate")}
+                className={`absolute right-1.5 top-1/2 -translate-y-1/2 w-7 h-7 flex items-center justify-center rounded-full transition-all duration-200 touch-none ${
+                  voice.listening ? "bg-red-500/90 text-white animate-pulse" : voice.error ? "text-red-400" : "text-text-muted hover:text-text"
+                }`}
+              >
+                {voice.listening ? <MicOff size={16} /> : <Mic size={16} />}
+              </button>
+            )}
+          </div>
+          <button
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={sendTextBatch}
+            disabled={false}
+            className={
+              isDesktop
+                ? "px-4 py-2 bg-brand-500 hover:bg-brand-600 text-white text-sm font-medium rounded-none transition-colors flex-shrink-0 flex items-center justify-center select-none"
+                : "px-3 py-2 bg-brand-500 hover:bg-brand-600 text-white text-sm font-medium rounded-xl transition-all duration-200 shadow-lg shadow-brand-500/20 flex-shrink-0 min-w-[56px] flex items-center justify-center"
+            }
+          >
+            {textInput.trim() || attachments.length ? t("mobileKeyboard.send") : <CornerDownLeft size={16} strokeWidth={2.5} />}
+          </button>
+        </div>
+      </div>
+
+      {/* Bottom keyboard bar */}
+      {!hasPhysicalKeyboard && (
+        <div
+          className="overflow-x-auto overflow-y-hidden touch-pan-x px-1.5 pb-1.5 safe-area-bottom bg-bg"
+        >
+          <div className="flex items-center gap-1 max-w-4xl mx-auto">
+            <div className="flex gap-1 flex-1 overflow-x-auto scroll-thin-x touch-pan-x pr-2 rounded-lg">
+              {basicCustom.keys
+                .filter(kc => kc.id !== TERMINAL_PINNED_KEY_ID)
+                .map((kc, idx) => renderKey(kc, idx))}
+            </div>
+            {/* Pinned Enter key — always visible next to expand button */}
+            {(() => {
+              const pinned = TERMINAL_KEY_POOL.find(p => p.id === TERMINAL_PINNED_KEY_ID);
+              return pinned ? (
+                <div className="flex-shrink-0">{renderKey(pinned, "pinned", false, true)}</div>
+              ) : null;
+            })()}
+            {/* Expand button */}
+            <button
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={toggleExpanded}
+              className={`${buttonBaseClass} ${isExpanded ? BUTTON_STYLES.modifierActive : BUTTON_STYLES.pinned} flex-shrink-0`}
+              style={BUTTON_STYLES.size}
+              title={t("mobileKeyboard.toggleExtraKeys")}
+            >
+              {isExpanded ? <X size={16} /> : <MoreHorizontal size={16} />}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <KeyCustomizeModal
+        isOpen={showCustomize}
+        onClose={() => setShowCustomize(false)}
+        title={t("mobileKeyboard.customizeTerminalKeys")}
+        tabs={[
+          { id: "basic", label: t("mobileKeyboard.mainBar"), hook: basicCustom, excludeIds: [TERMINAL_PINNED_KEY_ID] },
+          { id: "extra", label: t("mobileKeyboard.extraPanel"), hook: extraCustom }
+        ]}
+      />
+      <CommandHistoryModal
+        isOpen={showHistory}
+        onSelect={(cmd) => { setTextInput(cmd); textInputRef.current?.focus(); }}
+        onClose={() => setShowHistory(false)}
+      />
+    </div>
+  );
+};
+
+export default React.memo(MobileKeyboard);

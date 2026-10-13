@@ -1,0 +1,601 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Design tokens — synced with web/app/globals.css */
+:root {
+  --radius-brand: 8px;
+  --radius-brand-lg: 10px;
+}
+
+/* Light theme — GitBook-style softer brand (web light) */
+:root[data-theme="light"] {
+  --brand-500: #E85A2C;
+  --brand-600: #cc4e24;
+  --brand-400: #f2711c;
+  --brand-tint: rgba(232, 90, 44, 0.12);
+  --brand-rgb: 232, 90, 44;
+  --ring: rgba(232, 90, 44, 0.42);
+  --bg-body: #FCFBF9;
+  --bg-main: #FCFBF9;
+  --bg-alt: #F3F1ED;
+  --surface: #FFFFFF;
+  --surface-2: rgba(255, 255, 255, 0.9);
+  --sidebar: #F5F7FC;
+  --border: rgba(20, 30, 60, 0.10);
+  --border-subtle: rgba(20, 30, 60, 0.06);
+  --text-main: #0C1230;
+  --text-muted: #5A648A;
+  --glass-bg: rgba(255, 255, 255, 0.74);
+  --glass-border: rgba(20, 30, 60, 0.10);
+  --glass-hover: rgba(255, 255, 255, 0.9);
+  --grid-opacity: 0.08;
+  --header-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+  --surface-3: #E7E7E9;
+  --text-subtle: #8A93B4;
+  --success: #10B981;
+  --success-rgb: 16, 185, 129;
+  --danger: #DC2626;
+  --danger-rgb: 220, 38, 38;
+  --warn: #D97706;
+  --warn-rgb: 217, 119, 6;
+  --info: #7C3AED;
+  /* Cinematic light layers — login light-mode parity (dark ink on paper) */
+  --grid-line: rgba(0, 0, 0, 0.6);
+  --light-1: rgba(0, 0, 0, 0.045);
+  --light-2: rgba(0, 0, 0, 0.03);
+  --light-3: rgba(0, 0, 0, 0.02);
+  --row-bg: rgba(255, 255, 255, 0.72);
+  --row-hover: rgba(20, 30, 60, 0.04);
+  --pane-right-bg: rgba(255, 255, 255, 0.5);
+  --qr-plate-shadow: 0 24px 60px -20px rgba(60, 70, 120, 0.35), 0 0 0 1px var(--border-subtle);
+  --shadow-soft: 0 1px 2px 0 rgba(0, 0, 0, 0.04);
+  --shadow-elev:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.9),
+    0 24px 50px -20px rgba(60, 70, 120, 0.35);
+}
+
+/* Dark theme — web-login zinc (globals.css parity) */
+:root[data-theme="dark"] {
+  --brand-500: #FF6A3D;
+  --brand-600: #e5572c;
+  --brand-400: #ff8155;
+  --brand-tint: rgba(255, 106, 61, 0.12);
+  --brand-rgb: 255, 106, 61;
+  --ring: rgba(255, 106, 61, 0.55);
+  --bg-body: #0a0a0a;
+  --bg-main: #0a0a0a;
+  --bg-alt: #171717;
+  --surface: #171717;
+  --surface-2: #262626;
+  --sidebar: #0C1120;
+  --border: rgba(255, 255, 255, 0.10);
+  --border-subtle: rgba(255, 255, 255, 0.07);
+  --text-main: #fafafa;
+  --text-muted: #a1a1a1;
+  --glass-bg: rgba(38, 38, 38, 0.7);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-hover: #2a2a2a;
+  --grid-opacity: 0.04;
+  --header-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --surface-3: #2a2a2a;
+  --text-subtle: #737373;
+  --success: #34E5A4;
+  --success-rgb: 52, 229, 164;
+  --danger: #FF5252;
+  --danger-rgb: 255, 82, 82;
+  --warn: #FFC24B;
+  --warn-rgb: 255, 194, 75;
+  --info: #A855F7;
+  --shadow-soft: 0 1px 2px 0 rgba(0, 0, 0, 0.3);
+  --shadow-elev:
+    inset 0 1px 0 0 rgba(255, 255, 255, 0.06),
+    0 24px 60px -18px rgba(3, 6, 16, 0.9);
+  /* Cinematic light layers (login landing-light / hero-glow parity) */
+  --grid-line: rgba(255, 255, 255, 1);
+  --light-1: rgba(255, 255, 255, 0.10);
+  --light-2: rgba(255, 255, 255, 0.07);
+  --light-3: rgba(255, 255, 255, 0.035);
+  --row-bg: rgba(255, 255, 255, 0.04);
+  --row-hover: rgba(255, 255, 255, 0.03);
+  --pane-right-bg: rgba(23, 23, 23, 0.28);
+  --qr-plate-shadow: 0 24px 60px -20px rgba(0, 0, 0, 0.7), 0 0 0 1px var(--border-subtle);
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+  }
+
+  body {
+    font-family: "Sora", system-ui, sans-serif;
+    background-color: var(--bg-main);
+    color: var(--text-main);
+    -webkit-font-smoothing: antialiased;
+    user-select: text;
+    transition: background-color 0.3s ease, color 0.3s ease;
+  }
+
+  input, textarea {
+    accent-color: var(--brand-500);
+  }
+
+  button {
+    -webkit-user-select: none;
+    user-select: none;
+  }
+}
+
+@layer components {
+  /* Clean background — soft radial base (pro5 parity) */
+  .dot-grid-bg {
+    background: linear-gradient(160deg, var(--bg-alt), var(--bg-main) 55%, var(--bg-body));
+    transition: background 0.3s ease;
+  }
+
+  /* Conic rainbow shimmer — pro5 parity, no animation */
+  .conic {
+    position: fixed;
+    inset: -25%;
+    z-index: -2;
+    background: conic-gradient(from 0deg, #FF6A3D, #FF8A5B, #FFA860, #FF5252, #FF6A3D);
+    opacity: 0.06;
+    filter: blur(60px);
+    pointer-events: none;
+  }
+  [data-theme="light"] .conic {
+    background: conic-gradient(from 0deg, #E85A2C, #F2711C, #FF9F1C, #EF4444, #E85A2C);
+    opacity: 0.05;
+  }
+
+  /* Warm color wash — pro5 pcb layer minus the photo (warm undertone + brand glow) */
+  .bg-wash {
+    background:
+      linear-gradient(180deg, rgba(20, 12, 8, 0.72), rgba(12, 8, 6, 0.9)),
+      radial-gradient(120% 100% at 70% 20%, rgba(var(--brand-rgb), 0.14), transparent 55%);
+    opacity: 0.3;
+  }
+  [data-theme="light"] .bg-wash {
+    opacity: 0.22;
+    background:
+      linear-gradient(180deg, rgba(255, 250, 246, 0.82), rgba(255, 248, 242, 0.9)),
+      radial-gradient(120% 100% at 70% 20%, rgba(var(--brand-rgb), 0.1), transparent 55%);
+  }
+
+  /* Faint grid overlay — synced with web landing grid (absolute inside relative parent) */
+  .landing-grid {
+    background-image:
+      linear-gradient(to right, var(--brand-500) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--brand-500) 1px, transparent 1px);
+    background-size: 40px 40px;
+    opacity: var(--grid-opacity, 0.05);
+  }
+
+  /* Animated aurora blobs — slow drift, brand-tinted, behind content */
+  .aurora {
+    background:
+      radial-gradient(38% 44% at 18% 22%, rgba(var(--brand-rgb), 0.22), transparent 62%),
+      radial-gradient(32% 40% at 82% 12%, rgba(var(--brand-rgb), 0.14), transparent 60%),
+      radial-gradient(46% 50% at 70% 88%, rgba(var(--brand-rgb), 0.10), transparent 65%);
+    filter: blur(40px);
+    animation: aurora-drift 26s ease-in-out infinite alternate;
+    will-change: transform;
+  }
+  [data-theme="light"] .aurora { opacity: 0.5; }
+
+  /* Static warm glow — soft even radials that bleed warmth through the glass cards */
+  .bg-glow {
+    background:
+      radial-gradient(42% 48% at 22% 16%, rgba(var(--brand-rgb), 0.18), transparent 62%),
+      radial-gradient(48% 52% at 82% 82%, rgba(var(--brand-rgb), 0.10), transparent 66%);
+    filter: blur(50px);
+    opacity: 0.6;
+  }
+  [data-theme="light"] .bg-glow { opacity: 0.4; }
+
+  @keyframes aurora-drift {
+    from { transform: translate3d(-3%, -2%, 0) scale(1); }
+    to { transform: translate3d(4%, 3%, 0) scale(1.08); }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .aurora { animation: none; }
+  }
+
+  /* Login AnimatedBackground parity — accent grid + big blurred brand glow blobs */
+  .agent-grid {
+    background-image:
+      linear-gradient(to right, var(--brand-500) 1px, transparent 1px),
+      linear-gradient(to bottom, var(--brand-500) 1px, transparent 1px);
+    background-size: 40px 40px;
+    opacity: 0.05;
+  }
+  [data-theme="light"] .agent-grid { opacity: 0.09; }
+
+  /* Two huge soft glows — top-left bright, bottom-right deep (white, login parity) */
+  .agent-glow-tl {
+    background: radial-gradient(circle, rgba(255, 255, 255, 0.20), transparent 70%);
+    filter: blur(120px);
+  }
+  .agent-glow-br {
+    background: radial-gradient(circle, rgba(255, 255, 255, 0.10), transparent 70%);
+    filter: blur(140px);
+  }
+  [data-theme="light"] .agent-glow-tl { background: radial-gradient(circle, rgba(0, 0, 0, 0.05), transparent 70%); }
+  [data-theme="light"] .agent-glow-br { background: radial-gradient(circle, rgba(0, 0, 0, 0.03), transparent 70%); }
+
+  /* Vignette — darkens edges, focuses center (pro5 parity) */
+  .aurora-grain {
+    background:
+      radial-gradient(120% 90% at 50% 0%, transparent 42%, var(--bg-main) 100%),
+      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
+  }
+
+  /* Dark card — synced with web login card */
+  .dark-card {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-brand);
+    transition: background-color 0.3s ease, border-color 0.3s ease;
+  }
+
+  .dark-card-sm {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-brand);
+    transition: background-color 0.3s ease, border-color 0.3s ease;
+  }
+
+  /* Elevated cards — soft shadow, no flat border (web parity) */
+  .card-soft {
+    background: var(--surface);
+    box-shadow: var(--shadow-soft);
+    border-radius: var(--radius-brand-lg);
+    transition: background-color 0.2s ease, box-shadow 0.2s ease;
+  }
+
+  .card-elev {
+    background: var(--glass-bg);
+    box-shadow: var(--shadow-elev);
+    border: 1px solid var(--glass-border);
+    border-radius: var(--radius-brand-lg);
+    backdrop-filter: blur(20px) saturate(140%);
+    -webkit-backdrop-filter: blur(20px) saturate(140%);
+    transition: box-shadow 0.2s ease, border-color 0.2s ease;
+  }
+  .card-elev:hover {
+    border-color: var(--border);
+  }
+
+  /* Glass card — macOS frosted glass dialog style */
+  .glass-card {
+    background: var(--glass-bg);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    backdrop-filter: blur(24px) saturate(190%);
+    -webkit-backdrop-filter: blur(24px) saturate(190%);
+    box-shadow: 0 20px 50px -10px rgba(0, 0, 0, 0.55), inset 0 1px 0 0 rgba(255, 255, 255, 0.1);
+    transition: all 0.2s ease;
+  }
+
+  /* Hero workspace cards — mirror sheen animation on hover */
+  .hero-card {
+    position: relative;
+    overflow: hidden;
+    background: var(--row-bg);
+    border: 1px solid var(--border-subtle);
+    border-radius: 16px;
+    transition: transform 0.2s ease;
+  }
+
+  .hero-card:hover {
+    transform: translateY(-1px);
+  }
+
+  .hero-card::before {
+    content: "";
+    position: absolute;
+    top: -50%;
+    left: -65%;
+    width: 60%;
+    height: 200%;
+    background: linear-gradient(
+      115deg,
+      transparent 0%,
+      rgba(255, 255, 255, 0.02) 20%,
+      rgba(255, 255, 255, 0.22) 50%,
+      rgba(255, 255, 255, 0.02) 80%,
+      transparent 100%
+    );
+    transform: rotate(25deg);
+    pointer-events: none;
+    opacity: 0;
+  }
+
+  [data-theme="light"] .hero-card::before {
+    background: linear-gradient(
+      115deg,
+      transparent 0%,
+      rgba(255, 255, 255, 0.1) 20%,
+      rgba(255, 255, 255, 0.5) 50%,
+      rgba(255, 255, 255, 0.1) 80%,
+      transparent 100%
+    );
+  }
+
+  .hero-card:hover::before {
+    opacity: 1;
+    animation: mirror-sheen 1.5s linear infinite;
+  }
+
+  @keyframes mirror-sheen {
+    0% {
+      left: -65%;
+    }
+    100% {
+      left: 110%;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .hero-card:hover::before {
+      animation: none;
+    }
+  }
+
+  /* macOS frosted glass menu popover */
+  .menu-popover {
+    background: var(--glass-bg);
+    backdrop-filter: blur(20px) saturate(190%);
+    -webkit-backdrop-filter: blur(20px) saturate(190%);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: 0 16px 36px -4px rgba(0, 0, 0, 0.5), inset 0 0.5px 0 rgba(255, 255, 255, 0.12);
+  }
+
+  .glass-btn {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .glass-btn:hover {
+    background: var(--glass-hover);
+    border-color: var(--ring, var(--border));
+  }
+
+  .btn-primary {
+    background: linear-gradient(135deg, var(--brand-500), var(--brand-400));
+    border-radius: var(--radius-brand);
+    color: #fff;
+    font-weight: 600;
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    box-shadow: 0 8px 20px -6px rgba(var(--brand-rgb), 0.5);
+  }
+
+  .btn-primary:hover {
+    filter: brightness(1.06);
+    transform: translateY(-1px);
+  }
+
+  .btn-primary:disabled {
+    background: rgba(var(--brand-rgb), 0.3);
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+  }
+
+  .btn-danger {
+    background: rgba(220, 53, 69, 0.12);
+    border: 1px solid rgba(220, 53, 69, 0.25);
+    border-radius: var(--radius-brand);
+    color: #ff6b7a;
+    font-weight: 600;
+    transition: all 0.2s ease;
+  }
+
+  .btn-danger:hover {
+    background: rgba(220, 53, 69, 0.22);
+    border-color: rgba(220, 53, 69, 0.4);
+  }
+
+  /* Sidebar — vibrancy bg + right border */
+  .sidebar {
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent);
+    border-right: 1px solid var(--border);
+    backdrop-filter: blur(20px);
+  }
+
+  .brand-text {
+    font-family: "Sora", system-ui, sans-serif;
+    font-weight: 700;
+    font-size: 15px;
+    color: var(--text-main);
+    letter-spacing: -0.02em;
+  }
+
+  .material-symbols-outlined {
+    font-family: "Material Symbols Rounded";
+    font-variation-settings: "FILL" 0, "wght" 300, "GRAD" 0, "opsz" 24;
+  }
+
+  /* Filled icon variant for active nav */
+  .fill-1 {
+    font-variation-settings: "FILL" 1, "wght" 400, "GRAD" 0, "opsz" 24;
+  }
+
+  /* Monospace → JetBrains Mono with tabular numerals */
+  .font-mono {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Brand-tinted text selection */
+::selection {
+  background-color: rgba(var(--brand-rgb), 0.25);
+  color: var(--brand-500);
+}
+
+/* Health dot — soft spreading glow pulse (pro5 parity) */
+@keyframes health-pulse {
+  50% { box-shadow: 0 0 0 7px rgba(var(--success-rgb), 0.05); }
+}
+.health-dot {
+  box-shadow: 0 0 0 4px rgba(var(--success-rgb), 0.18);
+  animation: health-pulse 2.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) { .health-dot { animation: none; } }
+
+@keyframes pulse-ring {
+  0%   { transform: scale(0.8); opacity: 1; }
+  100% { transform: scale(1.6); opacity: 0; }
+}
+
+.pulse-ring {
+  animation: pulse-ring 1.4s ease-out infinite;
+}
+
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+/* Key generate buttons: spin the icon while the request is in flight */
+.qr-spin {
+  animation: spin 0.9s linear infinite;
+  transform-origin: 50% 50%;
+}
+
+@keyframes dot-bounce {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+  40%            { transform: scale(1);   opacity: 1; }
+}
+
+.dot-bounce {
+  animation: dot-bounce 1s ease-in-out infinite;
+}
+
+
+/* Thin continuous amber glow ring around focused pane */
+.terminal-focus-glow::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border: 2px solid #22c55e;
+  box-shadow: 0 0 8px rgba(34, 197, 94, 0.7);
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* Connection cards — borderless on dark, subtle border on light (session parity) */
+.conn-card { border: none; }
+:root[data-theme="light"] .conn-card { border: 1px solid var(--border-subtle); }
+
+.card-act { color: var(--text-muted); transition: all 0.15s ease; }
+.card-act:hover { background: var(--surface-2); color: var(--text-main); }
+
+/* ═══ Login-parity cinematic background (main-screen redesign) ═══ */
+
+/* Square grid, fading out toward the bottom (landing-grid parity) */
+.bg-sq-grid {
+  background-image:
+    linear-gradient(to right, var(--grid-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--grid-line) 1px, transparent 1px);
+  background-size: 40px 40px;
+  opacity: var(--grid-opacity);
+  -webkit-mask-image: radial-gradient(ellipse 120% 90% at 50% 0%, #000 30%, transparent 80%);
+  mask-image: radial-gradient(ellipse 120% 90% at 50% 0%, #000 30%, transparent 80%);
+}
+
+/* Drifting white light — landing-light parity */
+.bg-light-drift {
+  background:
+    radial-gradient(820px 620px at 18% 10%, var(--light-1), transparent 60%),
+    radial-gradient(720px 540px at 84% 80%, var(--light-2), transparent 65%),
+    radial-gradient(620px 420px at 55% 45%, var(--light-3), transparent 60%);
+  animation: light-drift 18s ease-in-out infinite alternate;
+  will-change: transform;
+}
+@keyframes light-drift {
+  0%   { transform: translate3d(-2%, -1%, 0) scale(1.05); opacity: 0.82; }
+  100% { transform: translate3d(2%, 2%, 0) scale(1.16); opacity: 1; }
+}
+
+/* Hero glow over the pairing pane — login-hero-glow parity (absolute in pane) */
+.pane-hero-glow {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(900px 700px at 58% 30%, var(--light-1), transparent 62%),
+    radial-gradient(1100px 800px at 12% 95%, var(--light-2), transparent 68%);
+  animation: hero-glow-drift 16s ease-in-out infinite alternate;
+  will-change: transform;
+}
+@keyframes hero-glow-drift {
+  0%   { transform: translate3d(-1.5%, -1%, 0) scale(1.04); opacity: 0.8; }
+  100% { transform: translate3d(2%, 1.5%, 0) scale(1.12); opacity: 1; }
+}
+
+/* Gradient text — login-hero-grad parity */
+.brand-grad-text {
+  background: linear-gradient(to bottom, var(--text-main), var(--text-muted));
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+/* Logo tile — dark glass with a faint brand halo */
+.logo-glass {
+  background: linear-gradient(150deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.02));
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.10), 0 0 22px -6px rgba(var(--brand-rgb), 0.45);
+}
+[data-theme="light"] .logo-glass {
+  background: linear-gradient(150deg, rgba(255, 255, 255, 0.9), rgba(255, 255, 255, 0.6));
+  border: 1px solid rgba(20, 30, 60, 0.10);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.9), 0 0 22px -8px rgba(var(--brand-rgb), 0.35);
+}
+
+/* Flat list row — hover does the grouping, no divider lines */
+.row-hover { transition: background-color 0.15s ease; }
+.row-hover:hover { background: var(--row-hover); }
+
+/* Header icon button (brand row) */
+.hdr-icon {
+  background: var(--row-bg);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-muted);
+  transition: all 0.15s ease;
+}
+.hdr-icon:hover {
+  color: var(--text-main);
+  border-color: var(--border);
+}
+.hdr-icon:disabled { opacity: 0.5; }
+
+/* Tunnel chip dot blink while connecting */
+@keyframes chip-blink { 50% { opacity: 0.35; } }
+.chip-blink { animation: chip-blink 1.2s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .bg-light-drift, .pane-hero-glow, .chip-blink { animation: none; }
+}
+

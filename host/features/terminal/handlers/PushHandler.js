@@ -1,0 +1,132 @@
+import { getVapidPublicKey, addPushSubscription, removePushSubscription, markSubscriptionConnected, setSubscriptionHidden } from "../pushManager.js";
+// enableToolHook/getHookStatus kept for reference (hooks auto-enabled on startup, not toggled by clients)
+import { getNotifications, getStatuses, clearStatus, STATES } from "../statusManager.js";
+import { getAutoStartStatus, setAutoStart, isCodespaces } from "../codespaceManager.js";
+import { writeCmd } from "../../../cli/utils/state.js";
+import { scanLocalSites } from "../portScanner.js";
+import { setMcpEnabled, MCP_CLIENTS } from "../../../mcp/mcpConfig.js";
+import { readSettings, writeSettings } from "../../../lib/settings.js";
+import { transcribeViaOpencode, MAX_AUDIO_B64_CHARS } from "../opencodeStt.js";
+import { broadcast } from "../../../transport/broadcast.js";
+
+export function setupPushHandlers(socket, io) {
+  // Full 4-state map (idle/working/blocked/done). New name; UI consumes this.
+  socket.on("getStatusState", () => {
+    socket.emit("statusState", getStatuses());
+  });
+
+  // Legacy: only done/blocked truthy map. Kept for older web clients.
+  socket.on("getNotificationState", () => {
+    socket.emit("notificationState", getNotifications());
+  });
+
+  // Local sites over the socket bus — works on RTC where the tunnel URL may be stale/absent
+  socket.on("getLocalSites", async (callback) => {
+    if (typeof callback !== "function") return;
+    try {
+      callback({ sites: await scanLocalSites() });
+    } catch (err) {
+      callback({ error: err.message });
+    }
+  });
+
+  // Trigger agent self-update via socket (authenticated, no HTTP through tunnel)
+  socket.on("requestUpdate", async () => {
+    const { pushUiEvent } = await import("../../../api/ui.js");
+    pushUiEvent("updating", {});
+    writeCmd("update");
+  });
+
+  // Restart agent host (no reinstall): kill + relaunch, ptyDaemon survives
+  socket.on("requestRestart", () => writeCmd("restart"));
+
+  // Clear on focus/input/switch → idle. Only broadcast when a DONE entry was actually cleared;
+  // working/blocked must survive focus so a running agent keeps its spinner.
+  socket.on("clearStatus", (sessionId) => {
+    if (!sessionId) return;
+    const cleared = clearStatus(sessionId);
+    if (cleared) {
+      broadcast(null, "statusCleared", sessionId);
+      broadcast(null, "notificationCleared", sessionId);
+    }
+  });
+  socket.on("clearNotification", (sessionId) => {
+    if (!sessionId) return;
+    const cleared = clearStatus(sessionId);
+    if (cleared) {
+      broadcast(null, "notificationCleared", sessionId);
+      broadcast(null, "statusCleared", sessionId);
+    }
+  });
+
+  socket.on("getVapidKey", (callback) => callback(getVapidPublicKey()));
+
+  socket.on("pushSubscribe", (subscription) => {
+    const identifier = subscription?.type === "expo" ? subscription.token : subscription?.endpoint;
+    if (!identifier) return;
+    markSubscriptionConnected(socket.id, identifier);
+    // Device identity reads the normalized field first — the handshake is the
+    // socket.io spelling of the same thing and stays for real-socket hosts.
+    addPushSubscription(subscription, socket.id, socket.data?.auth?.deviceId ?? socket.handshake?.auth?.deviceId);
+  });
+
+  socket.on("pushUnsubscribe", (identifier) => {
+    if (identifier) removePushSubscription(identifier);
+  });
+
+  socket.on("visibilityChange", (hidden) => setSubscriptionHidden(socket.id, hidden));
+
+  // Hooks are always auto-enabled on agent startup (badge in-app source); enable/disable/status not exposed to clients
+  // socket.on("enableHook", async ({ tool }, callback) => { try { callback(await enableToolHook(tool)); } catch (e) { callback({ success: false, error: e.message }); } });
+  // socket.on("disableHook", async ({ tool }, callback) => { try { callback(await disableToolHook(tool)); } catch (e) { callback({ success: false, error: e.message }); } });
+  // socket.on("getHookStatus", (callback) => callback(getHookStatus()));
+
+  // Artifact MCP: one switch that writes the endpoint into every AI CLI's own config.
+  // A running CLI reads its config at startup, so the change lands on its next launch.
+  socket.on("setArtifactEnabled", async ({ enabled } = {}, callback) => {
+    const value = setMcpEnabled(enabled);
+    callback?.({ success: true, enabled: value, clients: MCP_CLIENTS });
+    // Every other client mirrors this setting — imported lazily because terminalSocket
+    // is what mounts these handlers, so a static import would close the cycle.
+    const { broadcastServerInfo } = await import("../terminalSocket.js");
+    broadcastServerInfo();
+  });
+
+  socket.on("getVoiceConfig", (callback) => {
+    callback?.({ success: true, voiceConfig: readSettings().voiceConfig || null });
+  });
+
+  socket.on("setVoiceConfig", async ({ voiceConfig } = {}, callback) => {
+    const next = writeSettings({ voiceConfig });
+    callback?.({ success: true, voiceConfig: next?.voiceConfig || null });
+    const { broadcastServerInfo } = await import("../terminalSocket.js");
+    broadcastServerInfo();
+  });
+
+  // Free-tier voice STT runs agent-side: opencode.ai serves no CORS, so the browser can't call it
+  socket.on("voice:transcribe", async ({ audioB64, format, model, prompt } = {}, callback) => {
+    if (typeof callback !== "function") return;
+    if (typeof audioB64 !== "string" || !audioB64) return callback({ error: "bad-audio" });
+    if (audioB64.length > MAX_AUDIO_B64_CHARS) return callback({ error: "audio-too-large" });
+    if (!["mp3", "wav"].includes(format)) return callback({ error: "bad-format" });
+    if (!/^[\w.-]+$/.test(model || "")) return callback({ error: "bad-model" });
+    try {
+      const text = await transcribeViaOpencode(model, audioB64, String(prompt || "").slice(0, 2000), format);
+      callback({ text });
+    } catch (err) {
+      callback({ error: err?.message || "STT failed" });
+    }
+  });
+
+  socket.on("getAutoStartStatus", (callback) => {
+    if (!isCodespaces()) return callback({ success: false, error: "Not in Codespaces" });
+    const workspacePath = process.env.CODESPACE_VSCODE_FOLDER || process.cwd();
+    callback({ success: true, ...getAutoStartStatus(workspacePath) });
+  });
+
+  socket.on("setAutoStart", ({ enabled }, callback) => {
+    if (!isCodespaces()) return callback({ success: false, error: "Not in Codespaces" });
+    const workspacePath = process.env.CODESPACE_VSCODE_FOLDER || process.cwd();
+    callback(setAutoStart(workspacePath, enabled));
+  });
+}

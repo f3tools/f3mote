@@ -1,0 +1,87 @@
+"use client";
+
+import { useEffect } from "react";
+import { createPortal } from "react-dom";
+import { useI18n } from "@/shared/i18n";
+import { CornerDownLeft, X } from "@/shared/components/ui/Icon";
+
+// Shared text-prompt modal (rename flows): input + confirm/cancel, same chrome
+// as ConfirmDialog (portal, blocking backdrop, X). autoFocus during commit keeps
+// focus inside the tap's user-gesture window, so mobile keyboards open.
+export default function PromptDialog({ title, value, onChange, onSubmit, onClose, confirmLabel, cancelLabel, placeholder, hideCancel = false }) {
+  const { t } = useI18n();
+
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        onClose?.();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown, true);
+    return () => window.removeEventListener("keydown", handleKeyDown, true);
+  }, [onClose]);
+
+  if (typeof document === "undefined") return null;
+
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[100] flex items-center justify-center px-4"
+      style={{ paddingTop: "max(1rem, env(safe-area-inset-top))", paddingBottom: "max(1rem, env(safe-area-inset-bottom))" }}
+    >
+      {/* Backdrop */}
+      <div
+        className="absolute inset-0 bg-black/60 backdrop-blur-[2px] animate-in fade-in duration-150"
+        onClick={onClose}
+      />
+
+      {/* Dialog */}
+      <div
+        role="dialog"
+        aria-modal="true"
+        className="relative card-elev w-full max-w-xs p-5 my-auto max-h-[min(85%,calc(var(--app-height,85vh)-2rem))] overflow-y-auto animate-in zoom-in-95 duration-150"
+        onClick={(e) => e.stopPropagation()}
+        onKeyDown={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-2 mb-3">
+          <h3 className="text-[14px] font-semibold text-text">{title}</h3>
+          <button
+            onClick={onClose}
+            aria-label={t("common.close")}
+            className="p-1 -mr-1 -mt-1 text-text-muted hover:text-text hover:bg-surface-2 rounded-[3px] transition-colors shrink-0"
+          >
+            <X size={14} />
+          </button>
+        </div>
+        <input
+          autoFocus
+          value={value}
+          placeholder={placeholder}
+          onChange={(e) => onChange(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") onSubmit(); if (e.key === "Escape") onClose(); }}
+          className="w-full bg-surface-2 border border-border-subtle rounded-brand px-3 py-2 text-sm text-text outline-none focus:border-brand-500"
+        />
+        <div className="flex gap-2 mt-4">
+          <button
+            onClick={onSubmit}
+            disabled={!value?.trim()}
+            className="flex-1 py-2 text-sm font-semibold text-white bg-brand-500 rounded-brand disabled:opacity-40 flex items-center justify-center gap-1.5"
+          >
+            <span>{confirmLabel ?? t("common.confirm")}</span>
+            <kbd className="hidden sm:inline-flex items-center justify-center w-4 h-4 rounded bg-white/20 text-white">
+              <CornerDownLeft size={10} strokeWidth={2.5} />
+            </kbd>
+          </button>
+          {!hideCancel && (
+            <button onClick={onClose} className="flex-1 py-2 text-sm text-text-muted bg-surface-2 rounded-brand flex items-center justify-center gap-1.5">
+              <span>{cancelLabel ?? t("common.cancel")}</span>
+              <kbd className="hidden sm:inline-flex items-center text-[10px] font-mono px-1 py-0.5 rounded bg-surface-3 text-text-muted leading-none">Esc</kbd>
+            </button>
+          )}
+        </div>
+      </div>
+    </div>,
+    document.body
+  );
+}

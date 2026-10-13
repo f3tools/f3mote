@@ -1,0 +1,127 @@
+# Copy to web/wrangler.toml and fill in YOUR account values (wrangler.toml is gitignored).
+# Create the resources first, then paste the printed ids:
+#   npx wrangler d1 create f3mote
+#   npx wrangler kv namespace create OTA_KV
+# Secrets are NOT here — put them in web/.dev.vars (see .dev.vars.example)
+# and push with `npm run secrets:sync`.
+
+name = "f3mote-worker"
+main = ".open-next/worker.js"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+# Replace with your own domain (or delete [[routes]] to use *.workers.dev).
+[[routes]]
+pattern = "your-domain.com/*"
+zone_name = "your-domain.com"
+
+# Browsed local sites render here, never on the app origin (see shared/utils/sitesHost.js).
+# custom_domain so `deploy` creates the DNS record and cert itself — a plain
+# route would need the hostname to already resolve.
+[[routes]]
+pattern = "sites.your-domain.com"
+custom_domain = true
+
+[vars]
+CLOUDFLARE_ACCOUNT_ID = "YOUR_CLOUDFLARE_ACCOUNT_ID"
+TURN_KEY_ID = "YOUR_TURN_KEY_ID"
+BUILD_VERSION = "0.0.0"
+BUILD_TIME = "1970-01-01T00:00:00.000Z"
+ALLOWED_ORIGINS = "https://your-domain.com,http://localhost:3000"
+# Mobile shells below these versions see the update gate (web/app/api/version)
+MIN_APP_VERSION_ANDROID = "0.0.0"
+MIN_APP_VERSION_IOS = "0.0.0"
+# OTA: public R2 base (assets are served from a subdomain, not through Worker)
+R2_PUBLIC_BASE = "https://r2.your-domain.com"
+OTA_DEFAULT_CHANNEL = "production"
+
+# OTA manifest cache (signed payload) — create then set id:
+#   wrangler kv:namespace create OTA_KV
+[[kv_namespaces]]
+binding = "OTA_KV"
+id = "YOUR_KV_NAMESPACE_ID"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "f3mote"
+database_id = "YOUR_D1_DATABASE_ID"
+
+# Brute-force limiter for credential endpoints. Only FAILED attempts consume a
+# token (see shared/utils/rateLimit.js), so normal traffic never touches it.
+[[ratelimits]]
+name = "LOGIN_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 60, period = 60 }
+
+# Signaling DO — WebSocket Hibernation relay for WebRTC signaling fallback.
+# Injected into .open-next/worker.js by scripts/injectSignalingDO.mjs at build time.
+[[durable_objects.bindings]]
+name = "SIGNALING_DO"
+class_name = "SignalingDO"
+
+[[migrations]]
+tag = "v1-signaling"
+new_sqlite_classes = ["SignalingDO"]
+
+[triggers]
+crons = ["0 * * * *"]
+
+[observability]
+enabled = true
+
+[assets]
+directory = ".open-next/assets"
+binding = "ASSETS"
+# The sites host serves these two from the Worker, not from Assets: Assets would
+# 307 /proxy.html to /proxy (extension stripped), and the SW only accepts a
+# bridge whose path is /proxy.html. The security headers ride on that branch too.
+run_worker_first = ["/proxy.html", "/sw-site.js"]
+
+# Optional dev environment — `npx wrangler deploy --env dev`.
+[env.dev]
+name = "f3mote-worker-dev"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[[env.dev.routes]]
+pattern = "dev.your-domain.com/*"
+zone_name = "your-domain.com"
+
+[[env.dev.routes]]
+pattern = "sites-dev.your-domain.com"
+custom_domain = true
+
+[env.dev.vars]
+CLOUDFLARE_ACCOUNT_ID = "YOUR_CLOUDFLARE_ACCOUNT_ID"
+TURN_KEY_ID = "YOUR_TURN_KEY_ID"
+BUILD_VERSION = "0.0.0"
+BUILD_TIME = "1970-01-01T00:00:00.000Z"
+ALLOWED_ORIGINS = "https://dev.your-domain.com,http://localhost:3000"
+R2_PUBLIC_BASE = "https://r2.your-domain.com"
+OTA_DEFAULT_CHANNEL = "preview"
+
+[[env.dev.kv_namespaces]]
+binding = "OTA_KV"
+id = "YOUR_DEV_KV_NAMESPACE_ID"
+
+[[env.dev.d1_databases]]
+binding = "DB"
+database_name = "f3mote"
+database_id = "YOUR_D1_DATABASE_ID"
+
+[[env.dev.ratelimits]]
+name = "LOGIN_RATE_LIMITER"
+namespace_id = "1002"
+simple = { limit = 60, period = 60 }
+
+[[env.dev.durable_objects.bindings]]
+name = "SIGNALING_DO"
+class_name = "SignalingDO"
+
+[env.dev.triggers]
+crons = ["0 * * * *"]
+
+[env.dev.assets]
+directory = ".open-next/assets"
+binding = "ASSETS"
+run_worker_first = ["/proxy.html", "/sw-site.js"]

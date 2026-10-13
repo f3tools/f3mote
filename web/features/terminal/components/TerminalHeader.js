@@ -1,0 +1,1094 @@
+"use client";
+
+import { memo, useEffect, useMemo, useRef, useState } from "react";
+import {
+  ChevronLeft, ChevronRight, Menu, PanelLeft, PanelRight, Settings, Monitor, Smartphone, Plus, Pencil, Trash2, X, Globe, RotateCw, Github, Star, Bot, Zap, Check, Image as ImageIcon, Sparkles, Maximize2, Minimize2, Eye, EyeOff, Columns2, Link2, Loader2
+} from "@/shared/components/ui/Icon";
+import NotificationsBell from "./NotificationsBell";
+import SessionStatusBadge from "./SessionStatusBadge";
+import { vibrate } from "@/shared/utils/vibration";
+import { useSlideMenuStore } from "@/shared/stores/slideMenuStore";
+import { useTerminalStore } from "@/shared/stores/terminalStore";
+import { useBrowserStore } from "@/shared/stores/browserStore";
+
+// Stable fallbacks: a fresh [] / {} per selector call is a new getSnapshot every
+// render — React reads that as "store changed" and loops to max update depth.
+const NO_TABS = [];
+const NO_OBJ = {};
+import { useBrowserTabs } from "@/features/browser/hooks/useBrowserTabs";
+import { agentTabsForWorkspace } from "@/features/browser/lib/agentTabsScope";
+import { useFleetStore } from "@/shared/stores/fleetStore";
+import { useNotificationStore } from "@/shared/stores/notificationStore";
+import { connForSession, connOf, useAllSessionStatus } from "@/shared/transport/hostConn";
+import { useI18n } from "@/shared/i18n";
+import { useInputMode } from "@/shared/hooks/useInputMode";
+import { withHint } from "@/features/terminal/constants/shortcuts";
+import { statusVisual } from "@/shared/utils/statusVisual";
+import { isSameMachine } from "@/shared/utils/localOrigin";
+import NewTerminalModal from "@/shared/components/ui/NewTerminalModal";
+import PromptDialog from "@/shared/components/ui/PromptDialog";
+import ConfirmDialog from "@/shared/components/ui/ConfirmDialog";
+import useClampedMenu from "@/shared/hooks/useClampedMenu";
+import SessionBackgroundModal from "./SessionBackgroundModal";
+import { sessionWorkspaceId, UNGROUPED_KEY } from "@/features/terminal/lib/paneLayout";
+import { useDragReorder } from "@/features/terminal/hooks/useDragReorder";
+import { useGithubStars } from "@/shared/hooks/useGithubStars";
+import { GITHUB_REPO_URL } from "@/shared/constants/github";
+import { agentIconUrl, AGENT_ICON_CLS } from "@/features/terminal/constants/agentCli";
+import { PANEL_HEADER_H_CLASS } from "@/shared/constants/layout";
+import JarvisView from "@/features/jarvis/components/JarvisView";
+import { useJarvisStore } from "@/shared/stores/jarvisStore";
+import { JARVIS_ENABLED } from "@/shared/lib/jarvisConstants";
+import { useKanbanStore } from "@/shared/stores/kanbanStore";
+
+// Engines a terminal can be swapped into the chat UI.
+const UI_SWITCHABLE_ENGINES = new Set(["claude", "codex", "opencode", "antigravity", "omp", "pi", "devin", "hermes"]);
+// A turn in flight owns the conversation: the host would have to move it out from under
+// a running CLI. Only a settled terminal (idle, or a finished turn) may switch.
+export const SWITCHABLE_STATES = new Set(["idle", "done"]);
+
+export const isChatEngine = (agentId) => !!agentId && UI_SWITCHABLE_ENGINES.has(agentId.endsWith("-ui") ? agentId.slice(0, -3) : agentId);
+
+function TerminalHeader({
+  sessions = [],
+  allSessions = [],
+  activeSessionId,
+  connected,
+  notifications: propNotifications,
+  sessionStatus: propStatus,
+  onSwitchSession,
+  onCreateSession,
+  onBack,
+  onOpenRemote,
+  onOpenMobile,
+  // The host this header currently speaks for (null = the active host), plus the
+  // per-host feature doors — the buttons act on THAT machine, not the login one.
+  hostKey = null,
+  onOpenRemoteHost = null,
+  onOpenMobileHost = null,
+  onOpenFiles,
+  onLogout,
+  tunnelUrl,
+  apiKey,
+  connectionMode,
+  subscribeToPush,
+  unsubscribeFromPush,
+  hostVersion,
+  agentVersion,
+  busRef,
+  carrier = "ws",
+  isActive = true,
+  shells = [],
+  // Host-aware overrides for the new-terminal modal: when the active workspace
+  // belongs to another host, these point the modal at THAT host's bus/key/shells.
+  modalBusRef = null,
+  modalHostKey = "main",
+  modalShells = null,
+  workspaces = [],
+  activeWorkspaceId = null,
+  onRenameSession,
+  onDeleteSession,
+  onCreateNamedSession,
+  onResumeAgentSession = null,
+  onToggleSidebar = null,
+  sidebarCollapsed = false,
+  onToggleRightPanel,
+  onReorderSession,
+  rightPanelOpen = false,
+  fileBus = null,
+  homeDir = null,
+  isDesktop = true,
+}) {
+  const { t } = useI18n();
+  // Browser tabs live in the same strip (orca unified-tab pattern). They are
+  // client-side now (host-proxy browsing): clicking raises the browser pane,
+  // closing drops the tab — the pane ends the orphaned proxy session.
+  // Browser tabs belong to this workspace like terminal tabs do: the strip
+  // shows only ITS Chrome window of the workspace's profile.
+  const wsKey = activeWorkspaceId ?? "default";
+  const wsBrowserProfile = useBrowserStore((s) => s.workspaceProfiles[wsKey] || "default");
+  const wsWindowId = useBrowserStore((s) => s.workspaceWindows[wsKey] || null);
+  const browserTabs = useBrowserStore((s) => s.tabsByWorkspace[wsKey] ?? NO_TABS);
+  const activeBrowserTargetId = useBrowserStore((s) => s.activeByWorkspace[wsKey] || null);
+  const isBrowserView = useTerminalStore((s) => {
+    const stack = s.viewStack;
+    return Boolean(stack && stack[stack.length - 1]?.type === "browser");
+  });
+  const setActiveBrowserTab = useBrowserStore((s) => s.setActive);
+  // Engine-driven (own-mode) tabs of OTHER profiles/windows: shown in the same strip
+  // so anything the agent opens is visible no matter where it landed.
+  const agentTabs = useBrowserStore((s) => s.agentTabs);
+  const setProfileForWs = useBrowserStore((s) => s.setProfileFor);
+  const setWindowForWs = useBrowserStore((s) => s.setWindowFor);
+  const agentOnly = agentTabsForWorkspace(agentTabs, { wsKey, profile: wsBrowserProfile, ownTabs: browserTabs });
+  // Switching onto an agent tab must mirror the add-browser flow: profile AND
+  // the tab's Chrome window — without the window the workspace watches nothing
+  // and the pane has no tab to stream.
+  const pickAgentTab = (tab) => {
+    setProfileForWs(wsKey, tab.profile); // resets the window — set it after
+    if (tab.windowId != null) setWindowForWs(wsKey, tab.windowId);
+    setActiveBrowserTab(wsKey, tab.id);
+    pushView({ type: "browser" });
+  };
+  useBrowserTabs(busRef, connected, wsBrowserProfile, wsWindowId, wsKey);
+  const pushView = useTerminalStore((s) => s.pushView);
+  const popView = useTerminalStore((s) => s.popView);
+  const agentBySession = useTerminalStore((s) => s.agentBySession ?? NO_OBJ);
+  const fullModes = useTerminalStore((s) => s.fullModes ?? NO_OBJ);
+  const fullMode = fullModes[activeWorkspaceId ?? UNGROUPED_KEY] ?? false;
+  const toggleFullMode = useTerminalStore((s) => s.toggleFullMode);
+  const storeNotifications = useNotificationStore((s) => s.notifications);
+  const storeSessionStatus = useAllSessionStatus();
+  const notifications = propNotifications || storeNotifications;
+  const sessionStatus = propStatus || storeSessionStatus;
+
+  const { formattedStars } = useGithubStars();
+  // Chords only fire on desktop, so only a pointer device gets the hint.
+  const hasKeyboard = useInputMode() === "mouse";
+  const hint = (label, id) => (hasKeyboard ? withHint(label, id) : label);
+  const tabsContainerRef = useRef(null);
+  const activeTabRef = useRef(null);
+  const activeBrowserTabRef = useRef(null); // same scroll-into-view contract for browser tabs
+  const [browserTabMenu, setBrowserTabMenu] = useState({ targetId: null, x: 0, y: 0 });
+  const browserTabMenuRef = useRef(null);
+  const browserTabMenuPos = useClampedMenu(browserTabMenuRef, browserTabMenu.x, browserTabMenu.y);
+  // Tab right-click context menu (rename/delete)
+  const [tabMenu, setTabMenu] = useState({ sessionId: null, x: 0, y: 0 });
+  const [tabBgSessionId, setTabBgSessionId] = useState(null);
+  const tabMenuRef = useRef(null);
+  const tabMenuPos = useClampedMenu(tabMenuRef, tabMenu.x, tabMenu.y);
+  // The tab menu's switch door: which surface this tab is on, and whether the host may be
+  // asked to move it right now. The conversation is the host's precondition — a claude tab
+  // that has not started one yet has nothing to move — and status only carries a state
+  // while a turn is running or just finished, so a missing entry reads as idle.
+  const tabAgent = agentBySession[tabMenu.sessionId] || sessionStatus[tabMenu.sessionId]?.tool || sessions.find((s) => s.id === tabMenu.sessionId)?.agent;
+  const tabAsUi = tabAgent?.endsWith("-ui");
+  const tabSwitchable = isChatEngine(tabAgent);
+  const tabSwitchReady = tabSwitchable && SWITCHABLE_STATES.has(sessionStatus[tabMenu.sessionId]?.state || "idle");
+  const [tabDeleteConfirm, setTabDeleteConfirm] = useState({ isOpen: false, sessionId: null, sessionName: "" });
+  // Tab rename prompt (shared modal; inline input lost the iOS gesture window for focus)
+  const [renameDialog, setRenameDialog] = useState({ sessionId: null, name: "", value: "" });
+  // New terminal modal (named create)
+  const [createModalOpen, setCreateModalOpen] = useState(false);
+  // Jarvis coordinator surface — global overlay, opened by header button or ⌘J.
+  const jarvisOpen = useJarvisStore((s) => s.open);
+  const toggleJarvis = useJarvisStore((s) => s.toggle);
+  const jarvisEnabled = useJarvisStore((s) => JARVIS_ENABLED && s.settings.enabled);
+  const jarvisNeedsInput = useKanbanStore((s) => Object.values(s.board.tasks).some((t) => t.status === "needs_input"));
+  useEffect(() => {
+    if (!isActive || !jarvisEnabled) return;
+    const onKey = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "j") {
+        e.preventDefault();
+        toggleJarvis();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isActive, jarvisEnabled, toggleJarvis]);
+  // Drag-reorder the tab strip. No grip here — the strip is too tight for one — so a
+  // press only becomes a drag past the threshold; below it the tab still switches.
+  const selectTab = (sessionId) => {
+    vibrate();
+    if (hiddenPaneSessionIds.includes(sessionId)) unhidePane(sessionId);
+    onSwitchSession?.(sessionId);
+  };
+  const { dragId, registerEl, startDrag, consumeClick } = useDragReorder({
+    axis: "x",
+    // Higher than the sidebar's: that has a grip to grab, a tab is its own handle, so a
+    // twitch while clicking must still read as "switch to this tab".
+    threshold: 12,
+    onTap: selectTab,
+    onCommit: onReorderSession
+  });
+
+  // Every terminal that actually exists right now — a history row naming one of them
+  // focuses it instead of resuming a second copy of the same conversation.
+  const liveSessionIds = useMemo(() => new Set(allSessions.map((s) => s.id)), [allSessions]);
+
+  // Suggested default name based on terminal count in active group
+  const suggestTerminalName = (workspaceId) => `${t("terminal.defaultName")} ${sessions.filter((s) => sessionWorkspaceId(s) === (workspaceId ?? null)).length + 1}`;
+
+  // Ctrl+←/→ prev/next tab (wrap), Ctrl+1..9 jump tab N (9 = last if longer)
+  useEffect(() => {
+    if (!isActive) return;
+    const onKey = (e) => {
+      const el = document.activeElement;
+      if (!el || (el.tagName !== "INPUT" && el.tagName !== "TEXTAREA")) return;
+      if (!e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+      if (sessions.length < 2) return;
+      const idx = sessions.findIndex((s) => s.id === activeSessionId);
+      let target;
+      if (e.key === "ArrowRight") target = sessions[(idx + 1) % sessions.length];
+      else if (e.key === "ArrowLeft") target = sessions[(idx - 1 + sessions.length) % sessions.length];
+      else if (e.key >= "1" && e.key <= "9") target = sessions[Math.min(+e.key - 1, sessions.length - 1)];
+      else return;
+      e.preventDefault();
+      if (target && target.id !== activeSessionId) onSwitchSession?.(target.id);
+      requestAnimationFrame(() => requestAnimationFrame(() => el.focus()));
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isActive, sessions, activeSessionId, onSwitchSession]);
+
+  // Actions only (stable identities): this component WRITES context/callbacks, so
+  // subscribing to the whole store would re-render it on its own every write.
+  const openMenu = useSlideMenuStore((s) => s.open);
+  // Hidden by id rather than listed by id, so a button added later shows up
+  // instead of being invisible until the user finds the setting.
+  const hiddenHeaderButtons = useTerminalStore((s) => s.hiddenHeaderButtons);
+  const hiddenPaneSessionIds = useTerminalStore((s) => s.hiddenPaneSessionIds ?? NO_TABS);
+  const toggleHidePane = useTerminalStore((s) => s.toggleHidePane);
+  const unhidePane = useTerminalStore((s) => s.unhidePane);
+  const setFullMode = useTerminalStore((s) => s.setFullMode);
+  // A windowless emulator shows nothing on the host, so the button itself is
+  // the only indication that one is running.
+  const mainHead = useFleetStore((s) => s.currentKey);
+  const headerKey = hostKey || mainHead;
+  const headerHost = useFleetStore((s) => s.hosts[headerKey]);
+  const mobileDeviceCount = headerHost?.mobileDeviceCount || 0;
+  // Per-host capability: a foreign host decides for itself whether it can do
+  // remote desktop / mirroring / local sites. The active host keeps the values
+  // useAgentBus already resolved (serverInfo lands in its entry too).
+  const canRemote = hostKey ? !!headerHost?.remoteAvailable : !!onOpenRemote;
+  const canMobile = hostKey ? !!headerHost?.mobileAvailable : !!onOpenMobile;
+  // Local sites are the machine's own dev servers — browse the header host's.
+  const focusedBusRef = connOf(hostKey).busRef;
+  const showButton = (id) => !hiddenHeaderButtons.includes(id);
+  const setContext = useSlideMenuStore((s) => s.setContext);
+  const setCallbacks = useSlideMenuStore((s) => s.setCallbacks);
+
+  // Mod+Alt+T opens the new-terminal modal (browser reserves bare Mod+T)
+  useEffect(() => {
+    if (!isActive) return;
+    const onKey = (e) => {
+      if ((e.metaKey || e.ctrlKey) && e.altKey && !e.shiftKey && e.key.toLowerCase() === "t") {
+        e.preventDefault();
+        setCreateModalOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [isActive]);
+
+  // Close tab context menu on outside click / Escape
+  useEffect(() => {
+    if (!tabMenu.sessionId) return;
+    const onDocClick = (e) => {
+      if (tabMenuRef.current && !tabMenuRef.current.contains(e.target)) setTabMenu({ sessionId: null, x: 0, y: 0 });
+    };
+    const onKey = (e) => { if (e.key === "Escape") setTabMenu({ sessionId: null, x: 0, y: 0 }); };
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("touchstart", onDocClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("touchstart", onDocClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [tabMenu.sessionId]);
+
+  const handleTabContextMenu = (e, session) => {
+    e.preventDefault();
+    vibrate();
+    setTabMenu({ sessionId: session.id, x: e.clientX, y: e.clientY });
+  };
+
+  // Long-press on touch → open same context menu (touch has no reliable contextmenu event)
+  const longPressRef = useRef(null);
+  const handleTabTouchStart = (e, session) => {
+    const touch = e.touches[0];
+    longPressRef.current = setTimeout(() => {
+      vibrate();
+      setTabMenu({ sessionId: session.id, x: touch.clientX, y: touch.clientY });
+    }, 500);
+  };
+  const clearTabLongPress = () => {
+    if (longPressRef.current) { clearTimeout(longPressRef.current); longPressRef.current = null; }
+  };
+
+  // Same long-press contract for browser tabs — opens their menu instead.
+  const handleBrowserTabTouchStart = (e, tab) => {
+    const touch = e.touches[0];
+    longPressRef.current = setTimeout(() => {
+      vibrate();
+      setBrowserTabMenu({ targetId: tab.id, x: touch.clientX, y: touch.clientY });
+    }, 500);
+  };
+
+  const startTabRename = (session) => {
+    setRenameDialog({ sessionId: session.id, name: session.name || "", value: session.name || "" });
+    setTabMenu({ sessionId: null, x: 0, y: 0 });
+  };
+
+  const saveTabRename = () => {
+    const value = renameDialog.value.trim();
+    if (renameDialog.sessionId && value) onRenameSession?.(renameDialog.sessionId, value);
+    setRenameDialog({ sessionId: null, name: "", value: "" });
+  };
+
+  const openTabDeleteConfirm = (session) => {
+    setTabDeleteConfirm({ isOpen: true, sessionId: session.id, sessionName: session?.name || t("terminal.defaultName") });
+    setTabMenu({ sessionId: null, x: 0, y: 0 });
+  };
+
+  const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId) || null;
+
+  const handleModalCreate = (name, shellId, agent, yolo, cwd, nameIsAuto) => {
+    if (onCreateNamedSession) onCreateNamedSession(name, activeWorkspaceId, shellId, cwd || null, agent, yolo, nameIsAuto);
+    // No arg: onCreateSession is handleQuickCreateSession(shellId, …), which reads the
+    // active workspace from the store itself — passing an id here would land as a shell.
+    else onCreateSession?.();
+  };
+
+  // MUI-Tabs-style manual scroll: scrollTo a self-clamped target instead of
+  // scrollIntoView("center") — WebKit animates that unclamped request past the
+  // strip's max scroll and bounces back (visible on the first/last tab).
+  // Shared by terminal and browser tabs (same strip, same behavior).
+  const scrollTabIntoView = (tabRef) => {
+    // Defer 1 frame so a freshly-mounted tab is measured before scrolling
+    const id = requestAnimationFrame(() => {
+      const scroller = tabsContainerRef.current;
+      const tab = tabRef.current;
+      if (!scroller || !tab) return;
+      const delta = tab.getBoundingClientRect().left - scroller.getBoundingClientRect().left;
+      const centered = scroller.scrollLeft + delta - (scroller.clientWidth - tab.offsetWidth) / 2;
+      const max = scroller.scrollWidth - scroller.clientWidth;
+      scroller.scrollTo({ left: Math.max(0, Math.min(centered, max)), behavior: "smooth" });
+    });
+    return () => cancelAnimationFrame(id);
+  };
+
+  useEffect(
+    // Identity-only `sessions` churn (cwd/status ticks) must not re-scroll the strip
+    () => scrollTabIntoView(activeTabRef),
+    [activeSessionId, sessions.length]
+  );
+
+  useEffect(
+    () => scrollTabIntoView(activeBrowserTabRef),
+    [activeBrowserTargetId, browserTabs.length, isBrowserView]
+  );
+
+  // Last browser tab gone (closed here or by the page itself) → leave the
+  // browser overlay: staying put strands the pane on an empty new-tab stage.
+  // prev > 0 guard: a just-opened pane boots with 0 tabs and must not bounce.
+  // A profile switch also empties the strip but the user stays in the pane.
+  const prevBrowserTabCountRef = useRef(browserTabs.length);
+  const prevBrowserProfileRef = useRef(wsBrowserProfile);
+  useEffect(() => {
+    const prev = prevBrowserTabCountRef.current;
+    const switched = prevBrowserProfileRef.current !== wsBrowserProfile;
+    prevBrowserTabCountRef.current = browserTabs.length;
+    prevBrowserProfileRef.current = wsBrowserProfile;
+    if (prev > 0 && browserTabs.length === 0 && isBrowserView && !switched) popView();
+  }, [browserTabs.length, isBrowserView, wsBrowserProfile, popView]);
+
+  // Browser tab context menu — outside click / Escape closes, like the terminal one
+  useEffect(() => {
+    if (!browserTabMenu.targetId) return;
+    const onDown = (e) => {
+      if (browserTabMenuRef.current && !browserTabMenuRef.current.contains(e.target)) {
+        setBrowserTabMenu({ targetId: null, x: 0, y: 0 });
+      }
+    };
+    const onKey = (e) => { if (e.key === "Escape") setBrowserTabMenu({ targetId: null, x: 0, y: 0 }); };
+    window.addEventListener("pointerdown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("pointerdown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [browserTabMenu.targetId]);
+
+  useEffect(() => {
+    if (!isActive) return;
+    setContext({
+      connected,
+      remoteAvailable: !!onOpenRemote,
+          showTheme: false,
+      busRef,
+      tunnelUrl,
+      apiKey,
+      connectionMode,
+      subscribeToPush,
+      unsubscribeFromPush,
+      hostVersion: hostVersion || agentVersion,
+      agentVersion: hostVersion || agentVersion,
+      carrier,
+    });
+
+    setCallbacks({
+      onRemote: onOpenRemote,
+      onFiles: onOpenFiles,
+      onLogout,
+            });
+  }, [isActive, connected, onOpenRemote, onOpenFiles, onLogout, tunnelUrl, apiKey, connectionMode, hostVersion, agentVersion, busRef, carrier, subscribeToPush, unsubscribeFromPush, setContext, setCallbacks]);
+
+  return (
+    <div className={`h-9 ${PANEL_HEADER_H_CLASS} px-2 sm:pl-0 sm:pr-2 flex items-stretch gap-0 flex-shrink-0 bg-bg border-b border-border-subtle`}>
+      {onToggleSidebar && sidebarCollapsed && (
+        <button
+          onClick={() => { vibrate(); onToggleSidebar(); }}
+          className="p-1.5 text-text hover:bg-surface-2 hover:text-text rounded-brand transition duration-150 ease-out active:scale-[0.94] flex-shrink-0 self-center"
+          title={hint(t("common.open"), "toggleSidebar")}
+        >
+          <PanelLeft size={16} />
+        </button>
+      )}
+
+      {/* Nothing to go back to at the bottom of the desktop stack — this view IS the
+          bottom there, and the button would walk the user out of the app. */}
+      {onBack && (
+        <button
+          onClick={() => { vibrate(); onBack(); }}
+          className="p-1 pl-1.5 pr-3.5 sm:p-1.5 text-text hover:bg-surface-2 hover:text-text rounded-brand transition duration-150 ease-out active:scale-[0.94] flex-shrink-0 self-center"
+          title={t("common.back")}
+        >
+          <ChevronLeft size={20} className="sm:hidden" />
+          <ChevronLeft size={16} className="hidden sm:block" />
+        </button>
+      )}
+
+      {/* overflow-auto whitelists this for mobile touchmove (see page.js preventScroll) */}
+      <div ref={tabsContainerRef} className="flex-1 overflow-auto overflow-x-auto overflow-y-hidden scrollbar-none h-full">
+        <div className="flex gap-0 min-w-max items-stretch h-full">
+          {sessions.map((session) => {
+            const isActiveTab = session.id === activeSessionId && !isBrowserView;
+            const isHidden = hiddenPaneSessionIds.includes(session.id);
+            const st = sessionStatus[session.id]?.state || "idle";
+            const v = statusVisual(st);
+            const tabName = session.name || t("terminal.defaultName");
+            // The agent's own icon, or — for a chat UI, whose id carries a "-ui" suffix no
+            // icon file has — the engine's CLI icon.
+            const tabIcon = agentIconUrl(agentBySession[session.id]) || agentIconUrl(agentBySession[session.id]?.replace(/-ui$/, ""));
+            return (
+              <div
+                key={session.id}
+                role="button"
+                tabIndex={0}
+                ref={(el) => {
+                  registerEl(session.id)(el);
+                  if (isActiveTab) activeTabRef.current = el;
+                }}
+                onPointerDown={(e) => {
+                  // Mouse only: on touch this strip is a horizontal scroller, and
+                  // swallowing the gesture would trap it. Touch reorders in the sidebar.
+                  if (e.pointerType !== "mouse" || !onReorderSession || !connected) return;
+                  clearTabLongPress();
+                  startDrag(e, session.id, sessions.map((s) => s.id));
+                }}
+                onClick={() => {
+                  if (consumeClick()) return;
+                  selectTab(session.id);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    if (isHidden) unhidePane(session.id);
+                    onSwitchSession?.(session.id);
+                  }
+                }}
+                onContextMenu={(e) => handleTabContextMenu(e, session)}
+                onTouchStart={(e) => handleTabTouchStart(e, session)}
+                onTouchMove={clearTabLongPress}
+                onTouchEnd={clearTabLongPress}
+                className={`term-tab group relative px-1.5 sm:px-2.5 text-xs font-medium duration-150 ease-out flex items-center gap-1 sm:gap-2 whitespace-nowrap h-full cursor-pointer select-none touch-manipulation touch-pan-x ${
+                  isActiveTab ? "term-tab-active" : ""
+                } ${isHidden ? "opacity-75 hover:opacity-100" : ""} ${dragId === session.id ? "z-20 opacity-90 shadow-lg" : "transition"}`}
+              >
+                <div className="w-3.5 h-3.5 flex items-center justify-center shrink-0">
+                  {/* A quiet tab shows WHO lives here; the state dot only takes the slot when
+                      there is a state worth reporting (working/blocked/done) or no icon to show. */}
+                  {st === "idle" && tabIcon ? (
+                    <img
+                      src={tabIcon}
+                      alt=""
+                      draggable={false}
+                      className={`w-3.5 h-3.5 object-contain ${AGENT_ICON_CLS} ${onDeleteSession ? "sm:group-hover:hidden" : ""}`}
+                    />
+                  ) : (
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full term-dot ${v.cls}${v.pulse ? ` pulse-${v.pulse}` : ""} ${onDeleteSession ? "sm:group-hover:hidden" : ""}`}
+                      style={{ background: v.dot }}
+                      title={t(v.label)}
+                    />
+                  )}
+                  {/* Hover-only: safe because hover is transient. Touch has no hover, so a
+                      phone closes a terminal from the long-press menu instead. */}
+                  {onDeleteSession && (
+                    <button
+                      type="button"
+                      tabIndex={-1}
+                      onPointerDown={(e) => e.stopPropagation()}
+                      onMouseDown={(e) => e.stopPropagation()}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        vibrate();
+                        openTabDeleteConfirm(session);
+                      }}
+                      className="hidden w-full h-full p-0.5 rounded text-text hover:bg-text/15 sm:group-hover:flex items-center justify-center transition-colors"
+                      title={hint(t("sessions.deleteTitle"), "closeTerminal")}
+                    >
+                      <X size={11} strokeWidth={2.4} />
+                    </button>
+                  )}
+                </div>
+                <span className="truncate max-w-[90px] sm:max-w-[140px]" data-tip={tabName}>{tabName}</span>
+                {isHidden && (
+                  <button
+                    type="button"
+                    tabIndex={-1}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onMouseDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      vibrate();
+                      unhidePane(session.id);
+                    }}
+                    className="p-0.5 rounded text-amber-400 hover:text-amber-300 hover:bg-amber-400/20 transition-colors flex items-center justify-center shrink-0"
+                    title={t("sessions.showPanel") || "Show panel"}
+                  >
+                    <EyeOff size={13} />
+                  </button>
+                )}
+              </div>
+            );
+          })}
+          {/* Real Chrome tabs only — opening a browser happens from the new-terminal
+              modal's Browser button, so there is no pseudo opener tab here. */}
+          {browserTabs.map((tab) => {
+            const isActive = isBrowserView && (activeBrowserTargetId === tab.id || (!activeBrowserTargetId && tab.active));
+            return (
+              <div
+                key={tab.id}
+                ref={isActive ? activeBrowserTabRef : null}
+                role="button"
+                tabIndex={0}
+                onClick={() => {
+                  vibrate();
+                  setActiveBrowserTab(wsKey, tab.id);
+                  pushView({ type: "browser" });
+                }}
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  setBrowserTabMenu({ targetId: tab.id, x: e.clientX, y: e.clientY });
+                }}
+                onTouchStart={(e) => handleBrowserTabTouchStart(e, tab)}
+                onTouchMove={clearTabLongPress}
+                onTouchEnd={clearTabLongPress}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setActiveBrowserTab(wsKey, tab.id);
+                    pushView({ type: "browser" });
+                  }
+                }}
+                className={`term-tab group relative px-1.5 sm:px-2.5 text-xs font-medium flex items-center gap-1 sm:gap-2 whitespace-nowrap h-full cursor-pointer select-none touch-manipulation touch-pan-x ${
+                  isActive ? "term-tab-active" : ""
+                }`}
+              >
+                <div className="w-3.5 h-3.5 flex items-center justify-center shrink-0">
+                  {tab.booting
+                    ? <Loader2 size={13} className="w-3.5 h-3.5 animate-spin text-text-muted" />
+                    : <Globe size={13} className="w-3.5 h-3.5 text-text sm:group-hover:hidden" />}
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      vibrate();
+                      // Close the real Chrome tab; the next tabs.push reconciles the strip.
+                      busRef?.current?.emit?.("browser:invoke", { action: "close", payload: { targetId: tab.id, profile: wsBrowserProfile } }, () => {});
+                      const st = useBrowserStore.getState();
+                      const cur = st.tabsByWorkspace[wsKey] || [];
+                      const next = cur.filter((tb) => tb.id !== tab.id);
+                      st.setTabs(wsKey, next);
+                      if (st.activeByWorkspace[wsKey] === tab.id) {
+                        st.setActive(wsKey, next[0]?.id || null);
+                      }
+                    }}
+                    className="hidden w-full h-full p-0.5 rounded text-text hover:bg-text/15 sm:group-hover:flex items-center justify-center transition-colors"
+                    title={t("common.close")}
+                  >
+                    <X size={11} strokeWidth={2.4} />
+                  </button>
+                </div>
+                <span className="truncate max-w-[90px] sm:max-w-[140px]" data-tip={tab.title || t("sites.browserTab")}>
+                  {tab.title || t("sites.browserTab")}
+                </span>
+              </div>
+            );
+          })}
+          {/* Agent group: engine-opened tabs of any other profile — 🤖 + profile
+              name; picking one switches this workspace to that profile. */}
+          {agentOnly.map((tab) => (
+            <div
+              key={`ag-${tab.profile}-${tab.id}`}
+              role="button"
+              tabIndex={0}
+              onClick={() => {
+                vibrate();
+                pickAgentTab(tab);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  pickAgentTab(tab);
+                }
+              }}
+              className="term-tab group relative px-1.5 sm:px-2.5 text-xs font-medium flex items-center gap-1 sm:gap-2 whitespace-nowrap h-full cursor-pointer select-none touch-manipulation"
+              data-tip={`${tab.title || "Agent tab"} (${tab.profile})`}
+            >
+              <div className="w-3.5 h-3.5 flex items-center justify-center shrink-0">
+                <Bot size={13} className="w-3.5 h-3.5 text-brand-500 sm:group-hover:hidden" />
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    vibrate();
+                    busRef?.current?.emit?.("browser:invoke", { action: "close", payload: { targetId: tab.id, profile: tab.profile } }, () => {});
+                    useBrowserStore.getState().setAgentTabs(useBrowserStore.getState().agentTabs.filter((t) => t.id !== tab.id));
+                  }}
+                  className="hidden w-full h-full p-0.5 rounded text-text hover:bg-text/15 sm:group-hover:flex items-center justify-center transition-colors"
+                  title="Close"
+                >
+                  <X size={11} strokeWidth={2.4} />
+                </button>
+              </div>
+              <Bot size={11} className="w-3 h-3 text-brand-500 shrink-0 sm:hidden" />
+              <span className="truncate max-w-[70px] sm:max-w-[110px]">{tab.title || "Agent tab"}</span>
+              <span className="hidden sm:inline text-[9px] text-text-muted shrink-0">{tab.profile}</span>
+            </div>
+          ))}
+
+          {onCreateSession && (
+            <div className="sticky right-0 z-10 ml-1 pl-1 flex items-center flex-shrink-0 bg-bg">
+              <button
+                onClick={() => { vibrate(); setCreateModalOpen(true); }}
+                disabled={!connected}
+                className="p-1.5 text-text hover:bg-surface-2 hover:text-brand-500 transition duration-150 ease-out active:scale-[0.94] disabled:opacity-40 disabled:cursor-not-allowed rounded-brand"
+                title={hint(t("terminal.newTerminal"), "newTerminal")}
+              >
+                <Plus size={17} strokeWidth={2.4} />
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      <div className="flex items-center gap-2 flex-shrink-0 self-center">
+      {/* GitHub star — re-enable later
+      <a
+        href={GITHUB_REPO_URL}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="hidden sm:flex items-center gap-1 px-2 py-1 text-xs text-text hover:bg-surface-2 rounded-brand transition duration-150 ease-out active:scale-[0.94] flex-shrink-0"
+        title="Star on GitHub"
+      >
+        <Github size={15} />
+        <Star size={13} className="text-yellow-500 fill-yellow-500" />
+        {formattedStars && <span className="font-mono text-[11px]">{formattedStars}</span>}
+      </a> */}
+      {/* `isSameMachine()` (page served from this very machine) only rules remote
+          out for the ACTIVE host — a foreign host in view is a different machine,
+          so its own desktop is a legitimate target. */}
+      {showButton("remote") && canRemote && (hostKey || !isSameMachine()) && (
+        <button
+          onClick={() => { vibrate(); (hostKey ? onOpenRemoteHost : onOpenRemote)?.(hostKey || undefined); }}
+          className="hidden sm:block p-1.5 text-text hover:bg-surface-2 hover:text-text rounded-brand transition duration-150 ease-out active:scale-[0.94]"
+          title={t("menu.remoteDesktop")}
+        >
+          <Monitor size={16} />
+        </button>
+      )}
+      {showButton("mobile") && canMobile && (
+        <button
+          onClick={() => { vibrate(); (hostKey ? onOpenMobileHost : onOpenMobile)?.(hostKey || undefined); }}
+          className={`hidden sm:block p-1.5 hover:bg-surface-2 rounded-brand transition duration-150 ease-out active:scale-[0.94] ${
+            mobileDeviceCount > 0 ? "text-green-400" : "text-text hover:text-text"
+          }`}
+          title={mobileDeviceCount > 0
+            ? t("mobile.deviceRunning", { count: mobileDeviceCount })
+            : t("mobile.androidDevice")}
+        >
+          <Smartphone size={16} />
+        </button>
+      )}
+
+      {jarvisEnabled && (
+      <button
+        onClick={() => { vibrate(); toggleJarvis(); }}
+        disabled={!connected}
+        className={`relative p-1.5 hover:bg-surface-2 rounded-brand transition duration-150 ease-out active:scale-[0.94] disabled:opacity-40 disabled:cursor-not-allowed ${
+          jarvisNeedsInput ? "text-amber-400" : "text-text hover:text-text"
+        }`}
+        title="Jarvis coordinator (⌘J / Ctrl+J)"
+      >
+        <Bot size={16} />
+        {jarvisNeedsInput && (
+          <span className="absolute top-0.5 right-0.5 w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+        )}
+      </button>
+      )}
+
+      {showButton("notifications") && (
+        <SessionStatusBadge
+          sessionStatus={sessionStatus}
+          allSessions={allSessions}
+          onSwitchSession={onSwitchSession}
+        />
+      )}
+
+      {showButton("notifications") && (
+        <NotificationsBell
+          sessions={sessions}
+          allSessions={allSessions}
+          sessionStatus={sessionStatus}
+          onSwitchSession={onSwitchSession}
+          workspaces={workspaces}
+        />
+      )}
+
+      {/* Files / git / worktrees panel */}
+      {onToggleRightPanel && (
+        <button
+          onClick={() => { vibrate(); onToggleRightPanel(); }}
+          className={`hidden sm:block p-1.5 rounded-brand transition duration-150 ease-out active:scale-[0.94] hover:bg-surface-2 ${
+            rightPanelOpen ? "text-brand-500" : "text-text hover:text-text"
+          }`}
+          title={hint(t("workspaces.tabFiles"), "toggleRightPanel")}
+        >
+          <PanelRight size={16} />
+        </button>
+      )}
+
+      {/* Settings lives at the bottom of the sidebar on desktop; kept here for mobile */}
+      <button
+        onClick={() => { vibrate(); openMenu(); }}
+        className={`p-1.5 text-text hover:bg-surface-2 hover:text-text rounded-brand transition duration-150 ease-out active:scale-[0.94] ${onToggleSidebar ? "sm:hidden" : ""}`}
+        title={t("menu.title")}
+      >
+        <Settings size={16} />
+      </button>
+      </div>
+
+      {/* Browser tab right-click context menu */}
+      {browserTabMenu.targetId && (
+        <div
+          ref={browserTabMenuRef}
+          className="fixed z-[60] menu-popover p-1 min-w-[150px] animate-in fade-in zoom-in-95 duration-100"
+          style={{ left: browserTabMenuPos.left, top: browserTabMenuPos.top }}
+        >
+          <button
+            onClick={() => {
+              vibrate();
+              const url = browserTabs.find((t) => t.id === browserTabMenu.targetId)?.url;
+              if (url) navigator.clipboard?.writeText?.(url).catch(() => {});
+              setBrowserTabMenu({ targetId: null, x: 0, y: 0 });
+            }}
+            className="w-full text-left px-2.5 py-1.5 text-xs text-text hover:bg-surface-2/80 rounded-[6px] flex items-center gap-2"
+          >
+            <Link2 size={13} /> Copy URL
+          </button>
+          <button
+            onClick={() => {
+              vibrate();
+              busRef?.current?.emit?.("browser:invoke", {
+                action: "close",
+                payload: { targetId: browserTabMenu.targetId, profile: wsBrowserProfile }
+              }, () => {});
+              const st = useBrowserStore.getState();
+              const next = (st.tabsByWorkspace[wsKey] || []).filter((t) => t.id !== browserTabMenu.targetId);
+              st.setTabs(wsKey, next);
+              if (st.activeByWorkspace[wsKey] === browserTabMenu.targetId) {
+                st.setActive(wsKey, next[0]?.id || null);
+              }
+              setBrowserTabMenu({ targetId: null, x: 0, y: 0 });
+            }}
+            className="w-full text-left px-2.5 py-1.5 text-xs text-text hover:bg-surface-2/80 rounded-[6px] flex items-center gap-2"
+          >
+            <X size={13} /> {t("sessions.deleteTitle") || "Close tab"}
+          </button>
+        </div>
+      )}
+
+      {/* Tab right-click context menu */}
+      {tabMenu.sessionId && (
+        <div
+          ref={tabMenuRef}
+          className="fixed z-[60] menu-popover p-1 min-w-[140px] animate-in fade-in zoom-in-95 duration-100"
+          style={{ left: tabMenuPos.left, top: tabMenuPos.top }}
+        >
+          {/* Only a yellow terminal has something to mark read; typing/giving it a prompt
+              does the same thing, this is the explicit door. First, amber: it clears the
+              badge the user came here for. */}
+          {sessionStatus[tabMenu.sessionId]?.state === "done" && (
+            <button
+              onClick={() => {
+                vibrate();
+                useNotificationStore.getState().clearNotification(tabMenu.sessionId);
+                setTabMenu({ sessionId: null, x: 0, y: 0 });
+              }}
+              className="w-full text-left px-2.5 py-1.5 text-xs text-amber-500 hover:bg-amber-500/10 rounded-[6px] flex items-center gap-2"
+            >
+              <Check size={13} /> {t("sessions.markRead")}
+            </button>
+          )}
+          <button
+            onClick={() => startTabRename(sessions.find((s) => s.id === tabMenu.sessionId))}
+            className="w-full text-left px-2.5 py-1.5 text-xs text-text hover:bg-surface-2/80 rounded-[6px] flex items-center gap-2"
+          >
+            <Pencil size={13} /> {t("sessions.editName")}
+          </button>
+          {isDesktop && (
+            <div className="relative group/split">
+              <button
+                type="button"
+                onClick={() => {
+                  vibrate();
+                  if (!fullMode && tabMenu.sessionId && tabMenu.sessionId !== activeSessionId) {
+                    onSwitchSession?.(tabMenu.sessionId);
+                  }
+                  toggleFullMode(activeWorkspaceId);
+                  setTabMenu({ sessionId: null, x: 0, y: 0 });
+                }}
+                className="w-full text-left px-2.5 py-1.5 text-xs text-text hover:bg-surface-2/80 rounded-[6px] flex items-center justify-between"
+              >
+                <span className="flex items-center gap-2">
+                  <Columns2 size={13} />
+                  <span>{t("sessions.split") || "Split"}</span>
+                </span>
+                <ChevronRight size={12} className="text-text-muted" />
+              </button>
+
+              {/* Flyout submenu on hover */}
+              <div
+                className={`hidden group-hover/split:block absolute top-0 menu-popover p-1 min-w-[130px] shadow-xl z-20 ${
+                  tabMenuPos.left > (typeof window !== "undefined" ? window.innerWidth - 280 : 500)
+                    ? "right-full -mr-0.5"
+                    : "left-full -ml-0.5"
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={() => {
+                    vibrate();
+                    if (!fullMode && tabMenu.sessionId && tabMenu.sessionId !== activeSessionId) {
+                      onSwitchSession?.(tabMenu.sessionId);
+                    }
+                    toggleFullMode(activeWorkspaceId);
+                    setTabMenu({ sessionId: null, x: 0, y: 0 });
+                  }}
+                  className="w-full text-left px-2 py-1.5 text-xs text-text hover:bg-surface-2/80 rounded-[6px] flex items-center justify-between"
+                >
+                  <span className="flex items-center gap-1.5">
+                    {fullMode ? <Minimize2 size={12} /> : <Maximize2 size={12} />}
+                    <span className="whitespace-nowrap">{fullMode ? "Restore" : "Maximize"}</span>
+                  </span>
+                  <span className="text-[10px] text-text-muted">100%</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    vibrate();
+                    if (fullMode) setFullMode(activeWorkspaceId, false);
+                    window.dispatchEvent(new CustomEvent("terminal:splitPreset", { detail: { fraction: 2 } }));
+                    setTabMenu({ sessionId: null, x: 0, y: 0 });
+                  }}
+                  className="w-full text-left px-2 py-1.5 text-xs text-text hover:bg-surface-2/80 rounded-[6px] flex items-center justify-between"
+                >
+                  <span>1/2</span>
+                  <span className="text-[10px] text-text-muted">50%</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    vibrate();
+                    if (fullMode) setFullMode(activeWorkspaceId, false);
+                    window.dispatchEvent(new CustomEvent("terminal:splitPreset", { detail: { fraction: 3 } }));
+                    setTabMenu({ sessionId: null, x: 0, y: 0 });
+                  }}
+                  className="w-full text-left px-2 py-1.5 text-xs text-text hover:bg-surface-2/80 rounded-[6px] flex items-center justify-between"
+                >
+                  <span>1/3</span>
+                  <span className="text-[10px] text-text-muted">33%</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    vibrate();
+                    if (fullMode) setFullMode(activeWorkspaceId, false);
+                    window.dispatchEvent(new CustomEvent("terminal:splitPreset", { detail: { fraction: 4 } }));
+                    setTabMenu({ sessionId: null, x: 0, y: 0 });
+                  }}
+                  className="w-full text-left px-2 py-1.5 text-xs text-text hover:bg-surface-2/80 rounded-[6px] flex items-center justify-between"
+                >
+                  <span>1/4</span>
+                  <span className="text-[10px] text-text-muted">25%</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    vibrate();
+                    if (fullMode) setFullMode(activeWorkspaceId, false);
+                    window.dispatchEvent(new CustomEvent("terminal:splitPreset", { detail: { fraction: "auto" } }));
+                    setTabMenu({ sessionId: null, x: 0, y: 0 });
+                  }}
+                  className="w-full text-left px-2 py-1.5 text-xs text-text hover:bg-surface-2/80 rounded-[6px] flex items-center justify-between"
+                >
+                  <span>Auto Fit</span>
+                  <span className="text-[10px] text-text-muted">Auto</span>
+                </button>
+                <div className="h-px bg-border-subtle my-1" />
+                <button
+                  type="button"
+                  onClick={() => {
+                    vibrate();
+                    toggleHidePane(tabMenu.sessionId);
+                    setTabMenu({ sessionId: null, x: 0, y: 0 });
+                  }}
+                  className="w-full text-left px-2 py-1.5 text-xs text-text hover:bg-surface-2/80 rounded-[6px] flex items-center justify-between"
+                >
+                  <span className="flex items-center gap-1.5">
+                    {hiddenPaneSessionIds.includes(tabMenu.sessionId) ? <Eye size={12} /> : <EyeOff size={12} />}
+                    <span>{hiddenPaneSessionIds.includes(tabMenu.sessionId) ? (t("sessions.showPanel") || "Show") : (t("sessions.hidePanel") || "Hide")}</span>
+                  </span>
+                </button>
+              </div>
+            </div>
+          )}
+          {/* Per-tab background: the pool is global, this pins one for this terminal only */}
+          <button
+            onClick={() => { vibrate(); setTabBgSessionId(tabMenu.sessionId); setTabMenu({ sessionId: null, x: 0, y: 0 }); }}
+            className="w-full text-left px-2.5 py-1.5 text-xs text-text hover:bg-surface-2/80 rounded-[6px] flex items-center gap-2"
+          >
+            <ImageIcon size={13} className="flex-shrink-0" /> {t("menu.terminalBackground")}
+          </button>
+          {/* A UI pane may always restart its AI; a terminal only offers resume once
+              the CLI has reported a conversation id (lazy engines have none before
+              their first prompt — claude/codex spawn eager and do). */}
+          {(agentBySession[tabMenu.sessionId]?.endsWith("-ui") || sessionStatus[tabMenu.sessionId]?.conversationId) && (
+            <button
+              onClick={() => {
+                vibrate();
+                const id = tabMenu.sessionId;
+                // The bus follows the tab's host — a foreign session restarts on
+                // its own machine, never the main connection.
+                const bus = connForSession(id).bus;
+                if (agentBySession[id]?.endsWith("-ui")) {
+                  bus?.emit("ai:restart", { sessionId: id });
+                } else {
+                  bus?.emit("session-resume", { sessionId: id });
+                }
+                setTabMenu({ sessionId: null, x: 0, y: 0 });
+              }}
+              className="w-full text-left px-2.5 py-1.5 text-xs text-text hover:bg-surface-2/80 rounded-[6px] flex items-center gap-2"
+            >
+              <RotateCw size={13} /> {agentBySession[tabMenu.sessionId]?.endsWith("-ui") ? (t("sessions.restartAi") || "Restart AI") : t("sessions.resumeSession")}
+            </button>
+          )}
+          {/* Swap this terminal between the chat UI and the agent CLI in it. The host owns
+              the switch — it holds the conversation and the resume line — so the door is
+              only lit on a settled terminal, never mid-turn. */}
+          {tabSwitchable && (
+            <button
+              disabled={!tabSwitchReady}
+              onClick={() => {
+                vibrate();
+                const id = tabMenu.sessionId;
+                connForSession(id).bus?.emit(
+                  "setSessionMode",
+                  { sessionId: id, mode: tabAsUi ? "terminal" : "ui" },
+                  (res) => { if (!res?.success) alert(res?.error || t("sessions.modeSwitchFailed")); }
+                );
+                setTabMenu({ sessionId: null, x: 0, y: 0 });
+              }}
+              className={`w-full text-left px-2.5 py-1.5 text-xs rounded-[6px] flex items-center gap-2 ${
+                tabSwitchReady
+                  ? "text-text hover:bg-surface-2/80"
+                  : "text-text-subtle cursor-not-allowed"
+              }`}
+            >
+              <Sparkles size={13} /> {tabAsUi ? t("sessions.openAsTerminal") : t("sessions.openAsUi")}
+            </button>
+          )}
+          <button
+            onClick={() => openTabDeleteConfirm(sessions.find((s) => s.id === tabMenu.sessionId))}
+            className="w-full text-left px-2.5 py-1.5 text-xs text-red-500 hover:bg-red-500/10 rounded-[6px] flex items-center gap-2"
+          >
+            <Trash2 size={13} /> {t("sessions.deleteTitle")}
+          </button>
+        </div>
+      )}
+
+      {/* Per-tab background picker */}
+      {tabBgSessionId && (
+        <SessionBackgroundModal
+          sessionId={tabBgSessionId}
+          title={sessions.find((s) => s.id === tabBgSessionId)?.name}
+          busRef={busRef}
+          onClose={() => setTabBgSessionId(null)}
+        />
+      )}
+
+      {/* Tab rename dialog (shared prompt) */}
+      {renameDialog.sessionId && (
+        <PromptDialog
+          title={t("sessions.editName")}
+          placeholder={renameDialog.name}
+          value={renameDialog.value}
+          onChange={(value) => setRenameDialog({ ...renameDialog, value })}
+          onSubmit={saveTabRename}
+          onClose={() => setRenameDialog({ sessionId: null, name: "", value: "" })}
+        />
+      )}
+
+      {/* New terminal modal (shared) */}
+      {createModalOpen && (
+        <NewTerminalModal
+          onClose={() => setCreateModalOpen(false)}
+          onCreate={handleModalCreate}
+          workspaceId={activeWorkspaceId}
+          shells={modalShells || shells}
+          busRef={modalBusRef || busRef}
+          hostKey={modalHostKey}
+          suggestName={suggestTerminalName(activeWorkspaceId)}
+          workspacePath={activeWorkspace?.path || null}
+          workspaceName={activeWorkspace?.name || ""}
+          fileBus={fileBus}
+          homeDir={homeDir}
+          onResumeAgentSession={onResumeAgentSession}
+          onSelectSession={onSwitchSession}
+          liveSessionIds={liveSessionIds}
+          activeSessionId={activeSessionId}
+          connected={connected}
+        />
+      )}
+
+      {/* Tab delete confirm */}
+      <ConfirmDialog
+        isOpen={tabDeleteConfirm.isOpen}
+        onClose={() => setTabDeleteConfirm({ isOpen: false, sessionId: null, sessionName: "" })}
+        onConfirm={() => {
+          if (tabDeleteConfirm.sessionId) onDeleteSession?.(tabDeleteConfirm.sessionId);
+        }}
+        title={t("sessions.deleteTitle")}
+        message={t("sessions.deleteMessage", { name: tabDeleteConfirm.sessionName })}
+        confirmText={t("common.delete")}
+      />
+
+
+      {/* Jarvis coordinator overlay — fixed, so it floats over every pane */}
+      {jarvisOpen && (
+        <JarvisView
+          busRef={busRef}
+          fileBus={fileBus}
+          workspacePath={activeWorkspace?.path || ""}
+          onClose={() => useJarvisStore.getState().setOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
+// Props are stabilized upstream (memoized panel descriptors, `nav`, store actions), so
+// this only re-renders when something it actually shows changed.
+export default memo(TerminalHeader);

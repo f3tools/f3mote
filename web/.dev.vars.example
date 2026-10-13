@@ -1,0 +1,25 @@
+# =============================================================================
+# Wrangler local dev secrets (web/.dev.vars)
+# Copy file này thành web/.dev.vars rồi điền giá trị thật.
+# .dev.vars KHÔNG được commit (đã có trong .gitignore).
+# Production: dùng `npx wrangler secret put <NAME>` để upload encrypted.
+# =============================================================================
+
+# --- Cloudflare API (Tunnel/DNS/TURN management) ---
+CLOUDFLARE_API_KEY="cfk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+CLOUDFLARE_EMAIL="your-email@example.com"
+CLOUDFLARE_ACCOUNT_ID="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+ZONE_ID="34ed092484851b44d0ede479b0288738"
+
+# --- TURN/WebRTC ---
+TURN_KEY_ID="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+TURN_KEY_SECRET="xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# --- Master Auth Secret (generate: openssl rand -hex 32) ---
+# Dùng chung cho JWT admin, API key verification, mã hóa Token QR & cron cleanup.
+APP_SECRET="REPLACE_WITH_openssl_rand_hex_32"
+
+# (Tùy chọn ghi đè - nếu để trống sẽ tự dùng APP_SECRET ở trên)
+# ADMIN_JWT_SECRET="REPLACE_WITH_openssl_rand_hex_32"
+# CRON_SECRET="REPLACE_WITH_openssl_rand_hex_32"
+# TOKEN_SECRET="REPLACE_WITH_openssl_rand_hex_32"

@@ -1,0 +1,93 @@
+export const PERMISSIONS = {
+  sessionView: "session.view",
+  sessionDelete: "session.delete",
+  modeView: "mode.view",
+  modeManage: "mode.manage",
+  adminView: "admin.view",
+  adminManage: "admin.manage",
+  otaView: "ota.view",
+  otaManage: "ota.manage",
+  turnView: "turn.view",
+  turnManage: "turn.manage",
+  logView: "log.view"
+};
+
+export const PERMISSION_LIST = Object.values(PERMISSIONS);
+
+// Human-readable labels + domain grouping for the admin UI — raw keys
+// ("ota.manage") are for the wire, people read these.
+export const PERMISSION_META = {
+  "session.view": "View sessions",
+  "session.delete": "Delete sessions",
+  "admin.view": "View admins",
+  "admin.manage": "Create/edit admins",
+  "mode.view": "View modes",
+  "mode.manage": "Create/edit modes",
+  "ota.view": "View OTA updates",
+  "ota.manage": "Manage OTA updates",
+  "turn.view": "View TURN keys",
+  "turn.manage": "Manage TURN keys",
+  "log.view": "View login audit"
+};
+
+export const PERMISSION_GROUPS = [
+  { label: "Sessions", keys: ["session.view", "session.delete"] },
+  { label: "Admins", keys: ["admin.view", "admin.manage"] },
+  { label: "Modes", keys: ["mode.view", "mode.manage"] },
+  { label: "OTA & TURN", keys: ["ota.view", "ota.manage", "turn.view", "turn.manage"] },
+  { label: "Audit", keys: ["log.view"] }
+];
+
+// Login lockout tiers for the ip:<addr> key, checked in order — first tier whose
+// fails threshold is reached wins, so list the harshest first. Cumulative since
+// the last successful login, which resets the counter.
+export const ADMIN_LOGIN_LOCKS = [
+  { fails: 15, minutes: 24 * 60 },
+  { fails: 10, minutes: 60 },
+  { fails: 5, minutes: 15 }
+];
+
+// Account-wide delay: once the user:<name> key has this many failures, EVERY
+// attempt sleeps before verification (a correct password included — otherwise a
+// brute-forcer could probe for the delay-free path). Doubles per extra failure,
+// capped, so parallel guessing becomes too slow while a real user, whose success
+// clears the counter, essentially never waits.
+export const ADMIN_LOGIN_DELAY_AFTER_FAILS = 10;
+export const ADMIN_LOGIN_DELAY_MAX_MS = 10000;
+
+export const ADMIN_COOKIE_NAME = "f3mote_admin_token";
+export const ADMIN_TOKEN_TTL_SEC = 7 * 24 * 60 * 60;
+export const SESSION_ONLINE_THRESHOLD_MS = 30 * 60 * 1000;
+export const SESSION_R3_THRESHOLD_MS = 3 * 24 * 60 * 60 * 1000;
+export const SESSION_R7_THRESHOLD_MS = 7 * 24 * 60 * 60 * 1000;
+export const SESSION_RETURN_THRESHOLD_MS = 5 * 60 * 1000;
+export const SESSION_NEW_THRESHOLD_MS = 24 * 60 * 60 * 1000;
+export const SESSION_MAU_THRESHOLD_MS = 30 * 24 * 60 * 60 * 1000;
+
+export const PAGE_SIZE_DEFAULT = 20;
+export const PAGE_SIZE_OPTIONS = [10, 20, 50, 100];
+
+export const SESSION_SORT_FIELDS = ["createdAt", "lastAccessAt", "expiresAt", "machineId"];
+export const SORT_ORDERS = ["asc", "desc"];
+
+// Loyalty tiers by session age (lastAccessAt - createdAt), descending threshold
+export const LOYALTY_TIERS = [
+  { key: "loyal", label: "Loyal", minMs: SESSION_R7_THRESHOLD_MS, color: "text-success" },
+  { key: "returning", label: "Returning", minMs: SESSION_NEW_THRESHOLD_MS, color: "text-brand-500" },
+  { key: "active", label: "Active", minMs: SESSION_RETURN_THRESHOLD_MS, color: "text-brand-400" },
+  { key: "new", label: "New", minMs: 0, color: "text-text-muted" }
+];
+
+export const ADMIN_API = {
+  login: "/api/admin/login",
+  logout: "/api/admin/logout",
+  me: "/api/admin/me",
+  sessions: "/api/admin/sessions",
+  stats: "/api/admin/stats",
+  modes: "/api/admin/modes",
+  admins: "/api/admin/admins",
+  ota: "/api/admin/ota",
+  turn: "/api/admin/turn",
+  logins: "/api/admin/logins",
+  turnstile: "/api/admin/turnstile"
+};

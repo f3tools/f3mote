@@ -1,0 +1,455 @@
+// Tests for AI harness task model and event folding.
+// Run: cd web && node --import ./test/loader-alias.mjs test/aiHarnessTasks.test.mjs
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { applyTaskRecord, foldTaskRecords, runningTasks, taskElapsedMs } from "../features/ai/lib/harnessTasks.js";
+import { reduceSessionEvents } from "../features/ai/hooks/useAiSession.js";
+import { useAiStore } from "../shared/stores/aiStore.js";
+import { runningAsync, taskActivity } from "../features/ai/lib/toolTree.js";
+import { describeActivity } from "../features/ai/lib/liveStatus.js";
+import { clockText } from "../features/ai/lib/taskClock.js";
+
+let pass = 0, fail = 0;
+const test = (name, fn) => {
+  try { fn(); pass++; console.log(`  ok  ${name}`); }
+  catch (e) { fail++; console.error(`  FAIL ${name}\n       ${e.message}`); }
+};
+
+const feed = (records) =>
+  records.reduce((tasks, [subtype, record]) => applyTaskRecord(tasks, "system", subtype, record), []);
+
+test("a background shell's task_started is read as the CLI wrote it", () => {
+  const tasks = feed([["task_started", {
+    type: "system", subtype: "task_started", task_id: "bny62e391",
+    tool_use_id: "call_lr987rf2", description: "Sleep 15 seconds",
+    is_backgrounded: true, task_type: "local_bash"
+  }]]);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].taskId, "bny62e391");
+  assert.equal(tasks[0].toolUseId, "call_lr987rf2");
+  assert.equal(tasks[0].status, "running");
+  assert.equal(tasks[0].background, true);
+  assert.equal(tasks[0].taskType, "local_bash");
+});
+
+test("a sub-agent's task is told apart by the field the CLI uses", () => {
+  const tasks = feed([["task_started", {
+    type: "system", subtype: "task_started", task_id: "a74d7c02", tool_use_id: "call_pj23",
+    description: "Answer 2+2", subagent_type: "general-purpose", prompt: "what is 2+2?"
+  }]]);
+  assert.equal(tasks[0].background, false, "no is_backgrounded means not background work");
+  assert.equal(tasks[0].subagentType, "general-purpose");
+});
+
+test("task_updated merges the patch, under the CLI's own field names", () => {
+  const tasks = feed([
+    ["task_started", { type: "system", subtype: "task_started", task_id: "t-1", is_backgrounded: true }],
+    ["task_updated", { type: "system", subtype: "task_updated", task_id: "t-1", patch: { status: "paused", description: "still going" } }]
+  ]);
+  assert.equal(tasks[0].status, "paused");
+  assert.equal(tasks[0].description, "still going");
+});
+
+test("task_notification ends it with the status the CLI gave", () => {
+  const tasks = feed([
+    ["task_started", { type: "system", subtype: "task_started", task_id: "t-1", is_backgrounded: true }],
+    ["task_notification", {
+      type: "system", subtype: "task_notification", task_id: "t-1", status: "stopped",
+      output_file: "/tmp/tasks/t-1.output", summary: "Sleep 15 seconds"
+    }]
+  ]);
+  assert.equal(tasks[0].status, "stopped");
+  assert.equal(tasks[0].outputFile, "/tmp/tasks/t-1.output");
+});
+
+test("a finished sub-agent keeps the usage the CLI reported", () => {
+  const tasks = feed([
+    ["task_started", { type: "system", subtype: "task_started", task_id: "a-1", subagent_type: "Explore" }],
+    ["task_notification", {
+      type: "system", subtype: "task_notification", task_id: "a-1", status: "completed",
+      usage: { total_tokens: 1200, tool_uses: 2, duration_ms: 3400 }
+    }]
+  ]);
+  assert.equal(tasks[0].status, "completed");
+  assert.equal(tasks[0].usage.total_tokens, 1200, "kept under the CLI's names, not renamed");
+});
+
+test("a stopped task is not flattened into a completed one", () => {
+  const tasks = feed([
+    ["task_started", { type: "system", subtype: "task_started", task_id: "t-1", is_backgrounded: true }],
+    ["task_notification", { type: "system", subtype: "task_notification", task_id: "t-1", status: "stopped" }]
+  ]);
+  assert.equal(tasks[0].status, "stopped");
+});
+
+test("background_tasks_changed settles what it stops listing, and spares sub-agents", () => {
+  const tasks = feed([
+    ["task_started", { type: "system", subtype: "task_started", task_id: "shell-1", is_backgrounded: true }],
+    ["task_started", { type: "system", subtype: "task_started", task_id: "agent-1", subagent_type: "Explore" }],
+    ["background_tasks_changed", { type: "system", subtype: "background_tasks_changed", tasks: [] }]
+  ]);
+  const byId = Object.fromEntries(tasks.map((t) => [t.taskId, t]));
+  assert.equal(byId["shell-1"].status, "stopped", "a background task the CLI no longer lists ended");
+  assert.equal(byId["agent-1"].status, "running", "a sub-agent is never in that list");
+});
+
+test("the live set adds a task the pane never saw start", () => {
+  const tasks = feed([["background_tasks_changed", {
+    type: "system", subtype: "background_tasks_changed",
+    tasks: [{ task_id: "t-9", task_type: "local_bash", description: "build" }]
+  }]]);
+  assert.equal(tasks.length, 1);
+  assert.equal(tasks[0].taskId, "t-9");
+  assert.equal(tasks[0].status, "running");
+  assert.equal(tasks[0].background, true);
+});
+
+test("only running tasks reach the strip", () => {
+  const tasks = feed([
+    ["task_started", { type: "system", subtype: "task_started", task_id: "a", is_backgrounded: true }],
+    ["task_started", { type: "system", subtype: "task_started", task_id: "b", subagent_type: "Explore" }],
+    ["task_notification", { type: "system", subtype: "task_notification", task_id: "a", status: "completed" }]
+  ]);
+  assert.deepEqual(runningTasks(tasks).map((t) => t.taskId), ["b"]);
+});
+
+test("an unchanged re-announcement returns the same array", () => {
+  const once = feed([["task_started", { type: "system", subtype: "task_started", task_id: "t-1", description: "x" }]]);
+  const twice = applyTaskRecord(once, "system", "task_started", {
+    type: "system", subtype: "task_started", task_id: "t-1", description: "x"
+  });
+  assert.equal(twice, once, "same reference");
+});
+
+test("a record for an unknown task is ignored, not invented", () => {
+  const tasks = feed([["task_updated", { type: "system", subtype: "task_updated", task_id: "ghost", patch: { status: "completed" } }]]);
+  assert.deepEqual(tasks, []);
+});
+
+test("a record that is not a system task is left alone", () => {
+  const tasks = applyTaskRecord([], "assistant", "", { task_id: "x" });
+  assert.deepEqual(tasks, []);
+});
+
+test("a malformed record does not throw", () => {
+  for (const [subtype, record] of [
+    ["task_started", {}], ["task_started", null],
+    ["task_updated", { patch: null }], ["task_notification", {}],
+    ["background_tasks_changed", {}], ["something_new", { task_id: "x" }]
+  ]) {
+    assert.doesNotThrow(() => applyTaskRecord([], "system", subtype, record), `${subtype} must not throw`);
+  }
+});
+
+const asLog = (records) => records.map(([subtype, record], i) => ({
+  seq: i + 1, event: "cli_event", data: { type: "system", subtype, record }
+}));
+
+const RECORDS = [
+  ["task_started", { type: "system", subtype: "task_started", task_id: "shell-1", tool_use_id: "c1", description: "build", is_backgrounded: true }],
+  ["task_started", { type: "system", subtype: "task_started", task_id: "agent-1", tool_use_id: "c2", subagent_type: "Explore" }],
+  ["task_updated", { type: "system", subtype: "task_updated", task_id: "shell-1", patch: { status: "paused" } }],
+  ["background_tasks_changed", { type: "system", subtype: "background_tasks_changed", tasks: [] }],
+  ["task_notification", { type: "system", subtype: "task_notification", task_id: "agent-1", status: "completed" }]
+];
+
+test("the replay door folds the records into the task list", () => {
+  const out = reduceSessionEvents(asLog(RECORDS), "claude");
+  const byId = Object.fromEntries(out.harnessTasks.map((t) => [t.taskId, t]));
+  assert.equal(byId["shell-1"].status, "stopped");
+  assert.equal(byId["agent-1"].status, "completed");
+});
+
+test("the live door lands exactly what the replay door does", () => {
+  useAiStore.getState().initSession("parity");
+  for (const [type, subtype, record] of asLog(RECORDS).map((e) => [e.data.type, e.data.subtype, e.data.record])) {
+    useAiStore.getState().applyTaskRecords("parity", [[type, subtype, record]]);
+  }
+  const live = useAiStore.getState().bySession["parity"].harnessTasks;
+  const replay = reduceSessionEvents(asLog(RECORDS), "claude").harnessTasks;
+  const withoutClock = (tasks) => tasks.map(({ startedAt, ...rest }) => rest);
+  assert.deepEqual(withoutClock(live), withoutClock(replay), "two doors, one reader — they must not drift");
+});
+
+test("a record the reader does not model is still carried through the replay", () => {
+  const out = reduceSessionEvents(asLog([["api_retry", { type: "system", subtype: "api_retry", attempt: 2 }]]), "claude");
+  assert.equal(out.harnessRecords.length, 1);
+  assert.equal(out.harnessRecords[0][2].attempt, 2);
+});
+
+
+// ── the strip reads the harness's task set, not a guess ──
+
+
+test("a task the CLI says is running is what the strip shows", () => {
+  const rows = runningAsync([], [
+    { taskId: "shell-1", toolUseId: "c1", status: "running", background: true, description: "build" },
+    { taskId: "agent-1", toolUseId: "c2", status: "completed", background: false, description: "look" }
+  ]);
+  const shape = ({ kind, id, taskId, label }) => ({ kind, id, taskId, label });
+  assert.deepEqual(rows.map(shape), [{ kind: "shell", id: "c1", taskId: "shell-1", label: "build" }],
+    "the CLI's status decides, not a row that was handed off");
+});
+
+test("with no task set the row scan still answers, for engines that keep no model", () => {
+  const messages = [{ tools: [{ id: "call_x", name: "Agent", status: "running", async: true, input: { description: "look" } }] }];
+  const rows = runningAsync(messages, []);
+  assert.deepEqual(rows.map(({ kind, id, label }) => ({ kind, id, label })), [{ kind: "agent", id: "call_x", label: "look" }]);
+  assert.equal(rows[0].startedAt, undefined, "a scan row states no start");
+});
+
+test("the transcript reader emits the CLI's own record, not a name of its own", () => {
+  const src = readFileSync(new URL("../../host/features/ai/claudeTranscript.js", import.meta.url), "utf8");
+  assert.match(src, /subtype: "task_notification"/, "the replay must emit the harness's own subtype");
+  assert.doesNotMatch(src, /event: "task_done"/, "not a name invented for the replay");
+});
+
+test("the reader that folds records knows every subtype the host can send", () => {
+  const shapes = ["task_started", "task_updated", "task_notification", "background_tasks_changed"];
+  for (const subtype of shapes) {
+    const next = applyTaskRecord([], "system", subtype, { type: "system", subtype, task_id: "t-1" });
+    assert.ok(Array.isArray(next), `${subtype} must be handled`);
+  }
+  assert.deepEqual(applyTaskRecord([], "system", "item.started", { item: {} }), []);
+});
+
+test("hydrateSession takes the harness's task list, or the strip blanks on F5", () => {
+  useAiStore.getState().initSession("hyd");
+  useAiStore.getState().hydrateSession("hyd", {
+    messages: [],
+    harnessTasks: [{ taskId: "t-1", status: "running", background: true, description: "build" }]
+  });
+  assert.equal(useAiStore.getState().bySession["hyd"].harnessTasks.length, 1);
+});
+
+test("the reducer's rebuilt list is what a hydrate hands over", () => {
+  const out = reduceSessionEvents(asLog([
+    ["task_started", { type: "system", subtype: "task_started", task_id: "t-1", is_backgrounded: true, description: "build" }]
+  ]), "claude");
+  assert.equal(out.harnessTasks.length, 1, "the reducer rebuilds it");
+  assert.equal(out.harnessTasks[0].taskId, "t-1");
+});
+
+test("the live set does not blank a description it did not carry", () => {
+  let t = [];
+  t = applyTaskRecord(t, "system", "task_started", { task_id: "t-1", description: "build the thing", is_backgrounded: true });
+  t = applyTaskRecord(t, "system", "background_tasks_changed", { tasks: [{ task_id: "t-1", task_type: "local_bash" }] });
+  assert.equal(t[0].description, "build the thing", "a field the record did not carry is left as it was");
+  assert.equal(t[0].status, "running");
+});
+
+test("the live set still refreshes a field it does carry", () => {
+  let t = [];
+  t = applyTaskRecord(t, "system", "task_started", { task_id: "t-1", description: "old", is_backgrounded: true });
+  t = applyTaskRecord(t, "system", "background_tasks_changed", { tasks: [{ task_id: "t-1", description: "new", task_type: "local_bash" }] });
+  assert.equal(t[0].description, "new");
+});
+
+test("a re-announced task keeps the name the CLI gave it earlier", () => {
+  let t = [];
+  t = applyTaskRecord(t, "system", "task_started", { task_id: "a-1", description: "look it up", subagent_type: "Explore" });
+  t = applyTaskRecord(t, "system", "task_started", { task_id: "a-1", description: "look it up" });
+  assert.equal(t[0].subagentType, "Explore", "the type survives an announcement without it");
+  assert.equal(t[0].description, "look it up");
+});
+
+test("a task that resumes drops the end it reported before", () => {
+  let t = [];
+  t = applyTaskRecord(t, "system", "task_started", { task_id: "t-1", is_backgrounded: true });
+  t = applyTaskRecord(t, "system", "task_updated", { task_id: "t-1", patch: { status: "killed", end_time: 123 } });
+  assert.equal(t[0].endedAt, 123, "the end it reported is kept");
+  t = applyTaskRecord(t, "system", "task_updated", { task_id: "t-1", patch: { status: "running" } });
+  assert.equal(t[0].status, "running");
+  assert.equal("endedAt" in t[0], false, "no stale end on a task that is running again");
+});
+
+test("a paused task carries no end stamp either", () => {
+  let t = [];
+  t = applyTaskRecord(t, "system", "task_started", { task_id: "t-1", is_backgrounded: true });
+  t = applyTaskRecord(t, "system", "task_updated", { task_id: "t-1", patch: { status: "paused" } });
+  assert.equal(t[0].status, "paused");
+  assert.equal("endedAt" in t[0], false);
+});
+
+const rowLog = [
+  { seq: 1, event: "tool_start", data: { id: "c1", name: "Bash", input: { run_in_background: true } } },
+  { seq: 2, event: "tool_result", data: { id: "c1", name: "Bash", output: "Command running in background with ID: b1", status: "running", async: true, handle: "b1" } }
+];
+
+test("a task the CLI ended settles its row, so the card stops spinning", () => {
+  useAiStore.getState().initSession("settle");
+  const { messages } = reduceSessionEvents(rowLog, "claude");
+  useAiStore.getState().hydrateSession("settle", { messages });
+  assert.equal(useAiStore.getState().bySession["settle"].messages[0].tools[0].status, "running", "live work stays live");
+
+  useAiStore.getState().applyTaskRecords("settle", [
+    ["system", "task_started", { task_id: "t-1", tool_use_id: "c1", is_backgrounded: true }],
+    ["system", "task_notification", { task_id: "t-1", tool_use_id: "c1", status: "stopped" }]
+  ]);
+  assert.equal(useAiStore.getState().bySession["settle"].messages[0].tools[0].status, "done");
+});
+
+test("a failed task settles as an error, not a success", () => {
+  useAiStore.getState().initSession("failed");
+  useAiStore.getState().hydrateSession("failed", { messages: reduceSessionEvents(rowLog, "claude").messages });
+  useAiStore.getState().applyTaskRecords("failed", [
+    ["system", "task_started", { task_id: "t-1", tool_use_id: "c1", is_backgrounded: true }],
+    ["system", "task_notification", { task_id: "t-1", tool_use_id: "c1", status: "failed" }]
+  ]);
+  assert.equal(useAiStore.getState().bySession["failed"].messages[0].tools[0].status, "error");
+});
+
+test("a task still running leaves its row alone", () => {
+  useAiStore.getState().initSession("live");
+  useAiStore.getState().hydrateSession("live", { messages: reduceSessionEvents(rowLog, "claude").messages });
+  useAiStore.getState().applyTaskRecords("live", [
+    ["system", "task_started", { task_id: "t-1", tool_use_id: "c1", is_backgrounded: true }]
+  ]);
+  assert.equal(useAiStore.getState().bySession["live"].messages[0].tools[0].status, "running");
+});
+
+test("a replayed log settles the rows whose tasks are already over", () => {
+  const out = reduceSessionEvents(rowLog, "claude");
+  useAiStore.getState().initSession("replay");
+  useAiStore.getState().hydrateSession("replay", {
+    messages: out.messages,
+    harnessTasks: [{ taskId: "t-1", toolUseId: "c1", status: "completed", background: true }]
+  });
+  assert.equal(useAiStore.getState().bySession["replay"].messages[0].tools[0].status, "done");
+});
+
+test("an engine with no task model leaves every row as its adapter set it", () => {
+  useAiStore.getState().initSession("codex");
+  useAiStore.getState().hydrateSession("codex", { messages: reduceSessionEvents(rowLog, "codex").messages });
+  useAiStore.getState().applyTaskRecords("codex", [["system", "task_notification", { task_id: "t-1", tool_use_id: "c1", status: "completed" }]]);
+  assert.equal(useAiStore.getState().bySession["codex"].messages[0].tools[0].status, "running");
+});
+
+test("task records the replay tail never reached still arrive, from the host", () => {
+  const host = [
+    { type: "system", subtype: "task_started", record: { task_id: "t-1", tool_use_id: "c1", status: "running", is_backgrounded: true, description: "build" } }
+  ];
+  const tasks = foldTaskRecords(host, []);
+  assert.deepEqual(tasks.map((t) => [t.taskId, t.status, t.background]), [["t-1", "running", true]]);
+});
+
+test("the replayed window wins where both doors carry the same task", () => {
+  const host = [{ type: "system", subtype: "task_started", record: { task_id: "t-1", tool_use_id: "c1", status: "running", is_backgrounded: true } }];
+  const window = [{ taskId: "t-1", toolUseId: "c1", status: "completed", background: true }];
+  assert.deepEqual(foldTaskRecords(host, window).map((t) => t.status), ["completed"]);
+});
+
+test("a host that states no records leaves the window's own list alone", () => {
+  const window = [{ taskId: "t-1", status: "running", background: true }];
+  assert.deepEqual(foldTaskRecords(null, window).map((t) => t.taskId), ["t-1"]);
+});
+
+test("a /clear empties the task list, which is a statement and not a silence", () => {
+  useAiStore.getState().initSession("cleared");
+  useAiStore.getState().setTaskRecords("cleared", [
+    { type: "system", subtype: "task_started", record: { task_id: "t-1", status: "running", is_backgrounded: true } }
+  ]);
+  assert.equal(useAiStore.getState().bySession["cleared"].harnessTasks.length, 1);
+  useAiStore.getState().setTaskRecords("cleared", []);
+  assert.equal(useAiStore.getState().bySession["cleared"].harnessTasks.length, 0);
+});
+
+test("a reset that states nothing (an older host) does not wipe the list", () => {
+  useAiStore.getState().initSession("older");
+  useAiStore.getState().setTaskRecords("older", [
+    { type: "system", subtype: "task_started", record: { task_id: "t-1", status: "running", is_backgrounded: true } }
+  ]);
+  useAiStore.getState().setTaskRecords("older", undefined);
+  assert.equal(useAiStore.getState().bySession["older"].harnessTasks.length, 1);
+});
+
+test("a task's clock counts from the age the host stated, not from this pane's arrival", () => {
+  const before = Date.now();
+  const tasks = feed([["task_started", { task_id: "t-1", is_backgrounded: true, ageMs: 90_000 }]]);
+  const started = tasks[0].startedAt;
+  assert.ok(started >= before - 90_000 - 500 && started <= before - 90_000 + 500,
+    `expected a mark ~90s back, got ${before - started}ms`);
+  assert.ok(taskElapsedMs(tasks[0], before) >= 89_000, "and the elapsed reading agrees");
+});
+
+test("a live record (no age) starts its clock now", () => {
+  const before = Date.now();
+  const tasks = feed([["task_started", { task_id: "t-1", is_backgrounded: true }]]);
+  assert.ok(tasks[0].startedAt >= before && tasks[0].startedAt <= Date.now());
+});
+
+test("a re-announced task keeps the mark the pane has been counting from", () => {
+  const tasks = feed([
+    ["task_started", { task_id: "t-1", is_backgrounded: true, ageMs: 60_000 }],
+    ["background_tasks_changed", { tasks: [{ task_id: "t-1", task_type: "local_bash" }] }]
+  ]);
+  assert.ok(Date.now() - tasks[0].startedAt >= 59_000, "the original mark survives the republication");
+});
+
+test("a task the live set introduces gets a clock, from the record that introduced it", () => {
+  const before = Date.now();
+  const tasks = feed([["background_tasks_changed", { ageMs: 30_000, tasks: [{ task_id: "t-9", description: "build" }] }]]);
+  assert.ok(before - tasks[0].startedAt >= 29_000);
+});
+
+test("a resumed task is not charged for the time it spent stopped", () => {
+  const stopped = feed([
+    ["task_started", { task_id: "t-1", is_backgrounded: true, ageMs: 10_000 }],
+    ["task_updated", { task_id: "t-1", patch: { status: "killed", end_time: 123 } }]
+  ]);
+  assert.equal(stopped[0].endedAt, 123, "a task that ended carries the mark it ended at");
+  const resumed = feed([
+    ["task_started", { task_id: "t-1", is_backgrounded: true, ageMs: 10_000 }],
+    ["task_updated", { task_id: "t-1", patch: { status: "killed", end_time: 123 } }],
+    ["task_updated", { task_id: "t-1", patch: { status: "running" } }]
+  ]);
+  assert.equal(resumed[0].endedAt, undefined, "running again means the end is gone");
+  assert.ok(Date.now() - resumed[0].startedAt < 5_000, "and the clock restarted from the resume");
+});
+
+test("what a task is doing is its deepest RUNNING call, not its first", () => {
+  const messages = [{
+    tools: [{
+      id: "call_a", name: "Agent", status: "running", input: { description: "look" },
+      children: [
+        { id: "c1", name: "Read", status: "done", input: { file_path: "/w/a.js" } },
+        { id: "c2", name: "Bash", status: "running", input: { command: "npm test", description: "Run the suite" } }
+      ]
+    }]
+  }];
+  assert.equal(taskActivity(messages, "call_a")?.id, "c2");
+  assert.equal(describeActivity(taskActivity(messages, "call_a")), "Run the suite");
+});
+
+test("a task with nothing running under it still shows its last call", () => {
+  const messages = [{
+    tools: [{ id: "call_a", name: "Agent", status: "running", input: {}, children: [{ id: "c1", name: "Read", status: "done", input: { file_path: "/w/a.js" } }] }]
+  }];
+  assert.equal(taskActivity(messages, "call_a")?.id, "c1");
+  assert.equal(describeActivity(taskActivity(messages, "call_a")), "Reading a.js");
+});
+
+test("a task whose card is outside this pane's log draws no activity, not a wrong one", () => {
+  assert.equal(taskActivity([], "call_missing"), null);
+  assert.equal(taskActivity([{ tools: [] }], ""), null);
+});
+
+test("the clock reads in the units a reader is watching", () => {
+  assert.equal(clockText(0), "0s");
+  assert.equal(clockText(9_400), "9s");
+  assert.equal(clockText(64_000), "1m 04s");
+  assert.equal(clockText(3_720_000), "1h 02m");
+});
+
+test("a later init with no model does not wipe the model the pane is showing", () => {
+  const log = [
+    { seq: 1, event: "init", data: { model: "glm/glm-5.3", skills: [] } },
+    { seq: 2, event: "init", data: { model: "", effort: "high" } },
+  ];
+  const { metadata } = reduceSessionEvents(log, "codex");
+  assert.equal(metadata.model, "glm/glm-5.3");
+  assert.equal(metadata.effort, "high");
+});
+
+console.log(`\n${pass} passed, ${fail} failed`);
+if (fail) process.exitCode = 1;

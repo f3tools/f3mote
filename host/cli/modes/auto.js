@@ -1,0 +1,139 @@
+import { browserFetch, SERVER_PORT, STEP } from "../../lib/constants.js";
+import { getHostPublicKeyB64, getHostX25519PublicKeyB64 } from "../../lib/hostKey.js";
+import { createLogger } from "../../lib/logger.js";
+
+const logger = createLogger("mode");
+import { saveState, loadSettings } from "../utils/state.js";
+import { headOf } from "../utils/apiKey.js";
+import { killCloudflared, spawnQuickTunnel } from "../utils/cloudflared.js";
+import { updateTunnelHealthUrl } from "../utils/tunnelHealth.js";
+import {
+  isServerRunning, pushUiState, setStep,
+} from "../core/localApi.js";
+import { startServerWithRestart, setupExitHandler } from "../core/lifecycle.js";
+import { setupCmdPoller } from "../core/cmdPoller.js";
+import { makeTunnelRestartHandler, startBackgroundTunnelReconnect } from "../tunnel/manager.js";
+import { updateTunnelUrl, markRemoteOffline, startSessionHeartbeat } from "../tunnel/urlSync.js";
+import { waitForTunnelReady } from "../tunnel/readiness.js";
+import { ensureKeyData, getVersion } from "../session/key.js";
+import { showConnectionInfo } from "../session/display.js";
+import { showBanner } from "../utils/tui.js";
+import { maskApiKey } from "../utils/apiKey.js";
+import { WORKER_URL, DELAYS, POLL } from "../config.js";
+
+async function startServerAndTunnel(selectedKey) {
+  logger.info("Starting server...");
+  await setStep(STEP.PREPARING);
+
+  try { killCloudflared(); await new Promise((r) => setTimeout(r, DELAYS.killCloudflaredMs)); } catch {}
+
+  // User-switched off → local-only boot, no Worker attempt at all. Tell the
+  // Worker first: a crash while remote was on leaves agentOnline=1, and login
+  // would keep handing out this key through the whole grace window.
+  const remoteDisabled = loadSettings().remoteEnabled === false;
+  let remoteOnline = !remoteDisabled;
+  if (remoteDisabled) await markRemoteOffline(selectedKey);
+  if (remoteOnline) try {
+    const res = await browserFetch(`${WORKER_URL}/api/session/create`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ apiKey: headOf(selectedKey), hostPublicKey: getHostPublicKeyB64(), hostX25519Key: getHostX25519PublicKeyB64() }),
+    });
+    if (!res.ok) throw new Error(`Session create failed: ${res.status}`);
+    // Beat now, not at first tunnel URL: RTC-only is a valid online state.
+    startSessionHeartbeat(selectedKey);
+  } catch (e) {
+    logger.error(`Session create failed: ${e.message} — local-only, retry from Web UI`);
+    remoteOnline = false;
+  }
+
+  const alreadyRunning = await isServerRunning();
+  const serverManager = alreadyRunning
+    ? { getProcess: () => null, shutdown: () => {} }
+    : startServerWithRestart(null, null);
+
+  if (!alreadyRunning) await new Promise((r) => setTimeout(r, DELAYS.serverBootMs));
+
+  logger.info("Starting tunnel...");
+  await setStep(STEP.CONNECTING);
+
+  const tunnelRef = { current: null };
+  let tunnelUrl = "";
+  const onUrlUpdate = async (newUrl) => {
+    logger.info(`Tunnel URL rotated: ${newUrl}`);
+    await updateTunnelUrl(selectedKey, newUrl);
+    pushUiState({ tunnelUrl: newUrl });
+    updateTunnelHealthUrl(newUrl);
+  };
+  // Foreground: one spawn attempt. Fail/health-timeout → RTC-only + background reconnect.
+  let result = null;
+  if (remoteOnline) {
+    try {
+      result = await spawnQuickTunnel(
+        SERVER_PORT,
+        onUrlUpdate,
+        makeTunnelRestartHandler({ onUrlUpdate, setTunnel: (c) => { tunnelRef.current = c; } }),
+      );
+    } catch (error) {
+      logger.error(`Tunnel spawn failed: ${error.message} — RTC-only, bg retry`);
+    }
+  }
+  if (result) {
+    tunnelRef.current = result.child;
+    tunnelUrl = result.tunnelUrl;
+    if (!(await waitForTunnelReady(tunnelUrl))) {
+      logger.warn("Tunnel health check timed out — bg reconnect");
+      tunnelRef.current = null;
+      tunnelUrl = "";
+      result = null;
+    }
+  }
+  if (!result && remoteOnline) {
+    startBackgroundTunnelReconnect(SERVER_PORT, {
+      onUrlUpdate,
+      onRestart: makeTunnelRestartHandler({ onUrlUpdate, setTunnel: (c) => { tunnelRef.current = c; } }),
+      setActiveTunnel: (c) => { tunnelRef.current = c; },
+      onReady: async (r) => { await setStep(STEP.READY, { tunnelUrl: r.tunnelUrl }); },
+    });
+  }
+
+  if (tunnelUrl) await updateTunnelUrl(selectedKey, tunnelUrl);
+
+  // The foreground path must reach READY too — only bg-reconnect set it before,
+  // leaving getTunnelPayload() reporting "down" forever on a healthy tunnel.
+  if (remoteOnline) await setStep(STEP.READY, { tunnelUrl });
+  else await setStep(STEP.STOPPED, { tunnelUrl: "" });
+
+  saveState({
+    apiKey: selectedKey,
+    tunnelUrl,
+    serverPid: serverManager.getProcess()?.pid,
+    tunnelPid: tunnelRef.current?.pid,
+  });
+
+  return { serverManager, tunnelRef, tunnelUrl, remoteOnline };
+}
+
+export async function autoStartDev() {
+  showBanner(getVersion());
+  const keyData = await ensureKeyData();
+  logger.info(`Using key: ${maskApiKey(keyData.key)} (${keyData.name})`);
+
+  const { serverManager, tunnelRef, tunnelUrl, remoteOnline } = await startServerAndTunnel(keyData.key);
+
+  // Offline: showConnectionInfo would mint a temp key that cannot succeed and
+  // its READY fallback would mask the STOPPED state the retry button keys off.
+  if (remoteOnline) await showConnectionInfo(keyData.key, tunnelUrl);
+  else console.log(`⚠ ${loadSettings().remoteEnabled === false ? "Remote is disabled — enable it in Web UI settings" : "Remote not connected — tap \"remote · offline\" in the Web UI to retry"}. Local mode.`);
+  setupExitHandler(serverManager, tunnelRef.current);
+  setupCmdPoller(() => tunnelRef.current, (t) => { tunnelRef.current = t; }, keyData.key);
+
+  const startTime = Date.now();
+  setInterval(() => {
+    const uptime = Math.floor((Date.now() - startTime) / 1000);
+    const h = Math.floor(uptime / 3600), m = Math.floor((uptime % 3600) / 60), s = uptime % 60;
+    pushUiState({ uptime: `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}` });
+  }, POLL.statsMs);
+
+  await new Promise(() => {});
+}

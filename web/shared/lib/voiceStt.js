@@ -1,0 +1,233 @@
+// Voice STT via an OpenAI-compatible chat endpoint (default OpenRouter).
+// Shared by the settings modal (test buttons) and the AI dictation engine.
+import { useConnectionStore } from "@/shared/stores/connectionStore";
+
+export const VOICE_ENDPOINT_DEFAULT = "https://openrouter.ai/api/v1";
+// Kill switch — hides the agent-routed free preset and the Auto detect
+// language option; flip to true to bring them back.
+export const VOICE_FREE_STT_ENABLED = false;
+export const VOICE_LS_KEYS = {
+  enabled: "voiceEnabled", mode: "voiceMode",
+  // legacy flat config, read once for migration
+  endpoint: "voiceEndpoint", apiKey: "voiceApiKey", model: "voiceModel",
+  preset: "voicePreset", geminiKeys: "voiceGeminiKeys", openrouterKey: "voiceOpenrouterKey",
+  customEndpoint: "voiceCustomEndpoint", customModel: "voiceCustomModel", customKey: "voiceCustomKey",
+  opencodeModel: "voiceOpencodeModel",
+};
+
+// Presets fill endpoint + model; only the key(s) are user input.
+export const VOICE_PRESETS = {
+  gemini: {
+    label: "Gemini",
+    endpoint: "https://generativelanguage.googleapis.com/v1beta/openai",
+    model: "gemini-3.1-flash-lite",
+    note: "Free tier · quota per project (AI Studio)",
+  },
+  openrouter: {
+    label: "OpenRouter",
+    endpoint: VOICE_ENDPOINT_DEFAULT,
+    model: "google/gemini-3.5-flash-lite",
+    note: "≈5,000 voice inputs per $1",
+  },
+  // Free tier via the agent — opencode.ai has no CORS, so the browser cannot call it
+  opencode: {
+    label: "Free",
+    endpoint: "https://opencode.ai/zen/v1",
+    model: "mimo-v2.6-flash-free",
+    note: "OpenCode free · no key · routed through the agent",
+  },
+  custom: { label: "Custom" },
+};
+const REQUEST_TIMEOUT_MS = 15000;
+// Agent-side STT gets the upstream's full window — long dictation clips outrun 15s.
+const AGENT_STT_TIMEOUT_MS = 60000;
+const RECORD_MS = 3000;
+
+// ponytail: /models can't validate keys on OpenRouter (public route), so a
+// 1-token completion is the cheapest portable check of the key + model pair.
+export async function chat(cfg, body) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    if (!cfg.apiKey?.trim()) throw new Error("No API key set");
+    const base = (cfg.endpoint?.trim() || VOICE_ENDPOINT_DEFAULT).replace(/\/+$/, "");
+    const res = await fetch(`${base}/chat/completions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${cfg.apiKey}` },
+      body: JSON.stringify({ stream: false, ...body }),
+      signal: ctrl.signal,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data?.error?.message || `HTTP ${res.status}`);
+    return data;
+  } finally { clearTimeout(timer); }
+}
+
+export const sttErrText = (err) =>
+  err?.name === "AbortError" ? "Timed out" :
+  err?.message === "Failed to fetch" ? "Network/CORS error" :
+  err?.message || "Failed";
+
+// Some Android WebViews can't record the default webm — negotiate a codec the
+// recorder supports. Transcription decodes then re-encodes, so the choice is safe.
+const RECORDER_MIME_CANDIDATES = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus", "audio/aac"];
+export function pickRecorder(stream) {
+  const mimeType = RECORDER_MIME_CANDIDATES.find((m) => MediaRecorder.isTypeSupported?.(m));
+  return mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+}
+
+// Fixed-length clip for the test button; dictation manages its own recorder.
+export async function recordClip(ms = RECORD_MS) {
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  const rec = pickRecorder(stream);
+  const chunks = [];
+  rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  const stopped = new Promise((resolve) => { rec.onstop = resolve; });
+  rec.start();
+  await new Promise((resolve) => setTimeout(resolve, ms));
+  rec.stop();
+  await stopped;
+  stream.getTracks().forEach((t) => t.stop());
+  return new Blob(chunks, { type: rec.mimeType || "audio/webm" });
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result).split(",")[1]);
+    fr.readAsDataURL(blob);
+  });
+}
+
+// MP3 32kbps mono 16k is speech-grade and ~8x lighter than WAV on the wire.
+const MP3_KBPS = 32;
+const MP3_SAMPLE_CHUNK = 1152;
+
+function encodeMp3(lamejs, samples, rate) {
+  const enc = new lamejs.Mp3Encoder(1, rate, MP3_KBPS);
+  const pcm = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+  }
+  const parts = [];
+  for (let i = 0; i < pcm.length; i += MP3_SAMPLE_CHUNK) {
+    const buf = enc.encodeBuffer(pcm.subarray(i, i + MP3_SAMPLE_CHUNK));
+    if (buf.length) parts.push(new Uint8Array(buf));
+  }
+  const end = enc.flush();
+  if (end.length) parts.push(new Uint8Array(end));
+  return new Blob(parts, { type: "audio/mp3" });
+}
+
+// WAV fallback (~32 KB/s uncompressed) when the MP3 encoder is unavailable.
+function encodeWav(samples, rate) {
+  const buf = new ArrayBuffer(44 + samples.length * 2);
+  const v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, "RIFF"); v.setUint32(4, 36 + samples.length * 2, true); w(8, "WAVE");
+  w(12, "fmt "); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, "data"); v.setUint32(40, samples.length * 2, true);
+  let o = 44;
+  for (let i = 0; i < samples.length; i++, o += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buf], { type: "audio/wav" });
+}
+
+// Decode any recorded format to 16kHz mono, then encode MP3 (every OpenAI-compat
+// endpoint takes it); fall back to WAV when the encoder can't load.
+async function blobToAudio(blob) {
+  const RATE = 16000;
+  const dec = new OfflineAudioContext(1, 1, RATE);
+  const audio = await dec.decodeAudioData(await blob.arrayBuffer());
+  const out = new OfflineAudioContext(1, Math.ceil(audio.duration * RATE), RATE);
+  const src = out.createBufferSource();
+  src.buffer = audio;
+  src.connect(out.destination);
+  src.start();
+  const samples = (await out.startRendering()).getChannelData(0);
+  try {
+    const mod = await import("@breezystack/lamejs");
+    const lamejs = mod.default || mod;
+    if (typeof lamejs?.Mp3Encoder !== "function") throw new Error("encoder missing");
+    return { blob: encodeMp3(lamejs, samples, RATE), format: "mp3" };
+  } catch {
+    return { blob: encodeWav(samples, RATE), format: "wav" };
+  }
+}
+
+// Map the store state to the endpoint/model/key the request actually uses.
+// Gemini rotates across its key list — N free keys stack to N x free quota.
+let rrIdx = 0;
+export function resolveVoiceCfg(s) {
+  // Hidden free preset falls back to gemini so a dormant saved config still works
+  const preset = s.preset === "opencode" && !VOICE_FREE_STT_ENABLED ? "gemini" : s.preset;
+  if (preset === "opencode") {
+    return { endpoint: VOICE_PRESETS.opencode.endpoint, model: s.opencodeModel?.trim() || VOICE_PRESETS.opencode.model, apiKey: "public" };
+  }
+  if (preset === "gemini" || preset === "openrouter") {
+    const p = VOICE_PRESETS[preset];
+    const model = s[`${preset}Model`]?.trim() || p.model;
+    if (preset === "gemini") {
+      const keys = s.geminiKeys.map((k) => k.trim()).filter(Boolean);
+      return { endpoint: p.endpoint, model, apiKey: keys.length ? keys[rrIdx++ % keys.length] : "" };
+    }
+    return { endpoint: p.endpoint, model, apiKey: s.openrouterKey };
+  }
+  return { endpoint: s.customEndpoint, model: s.customModel, apiKey: s.customKey };
+}
+
+// "auto" leaves the language open; a concrete BCP-47 tag forces it — Chinese-centric
+// models like MiMo otherwise transcribe unfamiliar speech into Chinese characters.
+function languageName(tag) {
+  try {
+    return new Intl.DisplayNames(["en"], { type: "language" }).of(String(tag).split("-")[0]);
+  } catch {
+    return tag;
+  }
+}
+
+export function buildSttPrompt(lang) {
+  const name = lang && lang !== "auto" ? languageName(lang) : null;
+  const head = name
+    ? `The audio is spoken ${name}. Transcribe it verbatim in ${name}.\n- Do NOT translate to any other language.`
+    : "Auto-detect spoken language; do NOT translate.";
+  return `Transcribe this audio accurately for a developer coding & terminal context.
+- ${head}
+- Keep English tech terms, code, and CLI commands in English (e.g. git, npm, docker, API, bug, log, deploy).
+- Add natural punctuation. Omit filler sounds.
+- Output ONLY the transcribed text.`;
+}
+
+// Free preset: the agent does the upstream call (opencode.ai blocks browser CORS).
+function transcribeViaAgent(model, audioB64, prompt, format) {
+  return new Promise((resolve, reject) => {
+    const bus = useConnectionStore.getState().bus;
+    if (!bus || typeof bus.emit !== "function") return reject(new Error("No agent connection"));
+    const timer = setTimeout(() => reject(new Error("Timed out")), AGENT_STT_TIMEOUT_MS);
+    bus.emit("voice:transcribe", { audioB64, format, model, prompt }, (res) => {
+      clearTimeout(timer);
+      if (res?.error) reject(new Error(res.error));
+      else resolve(res?.text || "");
+    });
+  });
+}
+
+export async function transcribeBlob(state, blob, lang) {
+  const cfg = resolveVoiceCfg(state);
+  const prompt = buildSttPrompt(lang);
+  const { blob: audio, format } = await blobToAudio(blob);
+  const audioB64 = await blobToBase64(audio);
+  if (state.preset === "opencode" && VOICE_FREE_STT_ENABLED) return transcribeViaAgent(cfg.model, audioB64, prompt, format);
+  const data = await chat(cfg, {
+    model: cfg.model,
+    messages: [{ role: "user", content: [
+      { type: "text", text: prompt },
+      { type: "input_audio", input_audio: { data: audioB64, format } },
+    ]}],
+  });
+  return data?.choices?.[0]?.message?.content?.trim() || "";
+}
