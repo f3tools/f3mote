@@ -184,7 +184,7 @@ export default function TurnKeysPage() {
                 {busy ? "Validating with Cloudflare..." : "Add Key"}
               </Button>
               <span className="text-xs text-text-muted">
-                Scope <span className="font-mono">dev</span> = credentials for pages on dev.9remote.cc only.
+                Scope <span className="font-mono">dev</span> = credentials for pages on dev.relay.example.com only.
               </span>
             </div>
           </div>

@@ -64,14 +64,14 @@ test("node callers with no Origin still work", async () => {
 });
 
 test("a public route stays reachable cross-origin", async () => {
-  const res = await call("/api/health", { origin: "https://9remote.cc" });
+  const res = await call("/api/health", { origin: "https://relay.example.com" });
   assert.equal(res.status, 200);
-  assert.equal(res.headers.get("access-control-allow-origin"), "https://9remote.cc");
+  assert.equal(res.headers.get("access-control-allow-origin"), "https://relay.example.com");
 });
 
 test("no response carries the wildcard", async () => {
   for (const [path, origin] of [
-    ["/api/health", "https://9remote.cc"],
+    ["/api/health", "https://relay.example.com"],
     ["/api/health", "https://evil.com"],
     ["/api/ui/state", "http://localhost:2208"],
     ["/api/ui/state", "https://evil.com"]

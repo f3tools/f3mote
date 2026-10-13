@@ -18,7 +18,7 @@ import { showConnectionInfo } from "../session/display.js";
 import { shutdownAll } from "./lifecycle.js";
 import { runWebUpdate } from "../utils/updateChecker.js";
 import { restartServer } from "./lifecycle.js";
-import { WORKER_URL, POLL, DELAYS } from "../config.js";
+import { WORKER_URL, REMOTE_CONFIGURED, POLL, DELAYS } from "../config.js";
 
 export function setupCmdPoller(getActiveTunnel, setActiveTunnel, apiKey, getServerManager) {
   let busy = false;
@@ -92,6 +92,7 @@ async function handleStart(getActiveTunnel, setActiveTunnel, apiKey) {
     await setStep(STEP.PREPARING);
     await ensureCloudflared(onBinaryProgress);
 
+    if (!REMOTE_CONFIGURED) throw new Error("No relay configured. Set NREMOTE_WORKER_URL to enable phone access.");
     await setStep(STEP.CONNECTING);
     const sessionResponse = await browserFetch(`${WORKER_URL}/api/session/create`, {
       method: "POST",

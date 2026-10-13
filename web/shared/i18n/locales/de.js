@@ -184,7 +184,7 @@ export default {
     failedRenameSession: "Sitzung konnte nicht umbenannt werden: {error}"
   },
   sessions: {
-    headerTitle: "9remote.cc",
+    headerTitle: "relay.example.com",
     connected: "Verbunden",
     disconnected: "Getrennt",
     codespaceStopped: "Codespace gestoppt",

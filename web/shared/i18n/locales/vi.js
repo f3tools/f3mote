@@ -203,7 +203,7 @@ export default {
     failedRenameSession: "Không đổi tên được session: {error}"
   },
   sessions: {
-    headerTitle: "9remote.cc",
+    headerTitle: "relay.example.com",
     connected: "Đã kết nối",
     disconnected: "Mất kết nối",
     codespaceStopped: "Codespace đã dừng",

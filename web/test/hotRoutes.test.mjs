@@ -69,22 +69,22 @@ const sign = (body) => crypto.sign(null, Buffer.from(mutationPayload(body), "utf
 
 const API_KEY = "sk-abcd1234-qrstuvwx-yz234567"; // shape-valid v2 HEAD
 const env = (db) => ({ DB: db });
-const post = (path, body, headers = {}) => new Request(`https://9remote.cc${path}`, {
+const post = (path, body, headers = {}) => new Request(`https://relay.example.com${path}`, {
   method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body),
 });
 
 console.log("hotRoutes — hot session API copy");
 
 await test("unknown /api/session path falls through to Next (null)", async () => {
-  assert.equal(await handleHotRoutes(new Request("https://9remote.cc/api/session/delete", { method: "POST" }), env(fakeDb())), null);
+  assert.equal(await handleHotRoutes(new Request("https://relay.example.com/api/session/delete", { method: "POST" }), env(fakeDb())), null);
 });
 
 await test("non-POST falls through (Next answers 405 as before)", async () => {
-  assert.equal(await handleHotRoutes(new Request("https://9remote.cc/api/session/heartbeat", { method: "GET" }), env(fakeDb())), null);
+  assert.equal(await handleHotRoutes(new Request("https://relay.example.com/api/session/heartbeat", { method: "GET" }), env(fakeDb())), null);
 });
 
 await test("OPTIONS returns the same CORS preflight the Next route did", async () => {
-  const res = await handleHotRoutes(new Request("https://9remote.cc/api/session/heartbeat", { method: "OPTIONS" }), env(fakeDb()));
+  const res = await handleHotRoutes(new Request("https://relay.example.com/api/session/heartbeat", { method: "OPTIONS" }), env(fakeDb()));
   assert.ok(res instanceof Response);
   assert.ok(res.headers.get("Access-Control-Allow-Origin"));
 });

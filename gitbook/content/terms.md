@@ -42,4 +42,4 @@ We may update these terms. Continued use after an update means you accept the re
 
 ## Contact
 
-support@9remote.cc
+support@relay.example.com

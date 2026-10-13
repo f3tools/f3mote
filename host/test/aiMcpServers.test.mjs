@@ -53,7 +53,7 @@ write(".codex/config.toml", [
   "[mcp_servers.node_repl.env]",
   'FOO = "bar"',
   '[mcp_servers."f3mote"]',
-  'url = "https://9remote.cc/mcp"',
+  'url = "https://relay.example.com/mcp"',
   '[mcp_servers."f3mote".http_headers]',
   'Authorization = "Bearer x"',
   "[mcp_servers.computer-use]",

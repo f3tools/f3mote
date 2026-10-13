@@ -17,7 +17,7 @@
 globalThis.document = { addEventListener() {}, removeEventListener() {} };
 globalThis.window = { addEventListener() {}, removeEventListener() {} };
 // hostname too — termLog reads it at import time to decide whether to buffer.
-globalThis.location = { protocol: "https:", host: "dev.9remote.cc", hostname: "dev.9remote.cc" };
+globalThis.location = { protocol: "https:", host: "dev.relay.example.com", hostname: "dev.relay.example.com" };
 globalThis.localStorage = { getItem: () => null, setItem() {} };
 
 let pass = 0, fail = 0;

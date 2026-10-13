@@ -1,11 +1,13 @@
 import chalk from "chalk";
 
 // NODE_ENV=development only toggles local dev behavior (Vite proxy, logs) — the
-// target zone stays prod. Override with NREMOTE_WORKER_URL=https://dev.9remote.cc.
+// target zone stays prod. Override with NREMOTE_WORKER_URL=https://dev.relay.example.com.
 const IS_DEV = process.env.NODE_ENV === "development";
 export const IS_DEV_ENV = IS_DEV;
 export const WORKER_URL = process.env.NREMOTE_WORKER_URL
-  || (typeof __DEFAULT_WORKER_URL__ !== "undefined" ? __DEFAULT_WORKER_URL__ : "https://9remote.cc");
+  || (typeof __DEFAULT_WORKER_URL__ !== "undefined" ? __DEFAULT_WORKER_URL__ : "");
+// No relay configured = fully local host. Phone access needs a relay the user runs.
+export const REMOTE_CONFIGURED = Boolean(WORKER_URL);
 export const SERVER_HEALTHY_RESET_MS = 30000;
 export const SHUTDOWN_EXIT_DELAY_MS = 500;
 export const SHUTDOWN_CRASH_DELAY_MS = 300;

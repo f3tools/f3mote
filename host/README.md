@@ -22,7 +22,7 @@
   [![Downloads](https://img.shields.io/npm/dm/f3mote.svg)](https://www.npmjs.com/package/f3mote)
   [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](#-license)
 
-  [🚀 Quick Start](#-quick-start) • [📱 Platforms](#-supported-platforms) • [✨ 8 Superpowers](#-8-remote-superpowers) • [🛡️ Security](#-zero-trust-security-architecture) • [📊 Comparison](#-how-f3mote-compares) • [🌐 Website](https://9remote.cc) • [📖 Docs](https://docs.9remote.cc)
+  [🚀 Quick Start](#-quick-start) • [📱 Platforms](#-supported-platforms) • [✨ 8 Superpowers](#-8-remote-superpowers) • [🛡️ Security](#-zero-trust-security-architecture) • [📊 Comparison](#-how-f3mote-compares) • [🌐 Website](https://relay.example.com) • [📖 Docs](https://docs.relay.example.com)
 </div>
 
 ---
@@ -57,7 +57,7 @@ f3mote
 | **macOS** | ✅ | ✅ | `npm i -g f3mote` or [Download .dmg](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-macos-universal.dmg) |
 | **Windows** | ✅ | ✅ | `npm i -g f3mote` or [Download .exe](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-windows-x64-setup.exe) |
 | **Linux** | ✅ | ✅ | `npm i -g f3mote` or [Download .deb / .AppImage](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-linux-amd64.deb) |
-| **Web Browser** | — | ✅ | [`https://9remote.cc/login`](https://9remote.cc/login) *(Zero install, any browser)* |
+| **Web Browser** | — | ✅ | [`https://relay.example.com/login`](https://relay.example.com/login) *(Zero install, any browser)* |
 | **iOS / iPadOS** | — | ✅ | Web / PWA (Add to Home Screen) *(Supports iPad keyboard & trackpad)* |
 | **Android** | — | ✅ | Web / PWA (Add to Home Screen) *(Fullscreen dev mode)* |
 

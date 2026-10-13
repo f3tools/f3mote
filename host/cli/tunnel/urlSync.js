@@ -10,7 +10,7 @@ import {
 } from "../utils/tunnelHealth.js";
 import { getLanIp } from "../core/localApi.js";
 import { waitForTunnelReady } from "./readiness.js";
-import { WORKER_URL, URL_SYNC_DEBOUNCE_MS, FAST_PROBE_TIMEOUT_MS, SESSION_HEARTBEAT_INTERVAL_MS, HEARTBEAT_GOODBYE_MAX_MS } from "../config.js";
+import { WORKER_URL, REMOTE_CONFIGURED, URL_SYNC_DEBOUNCE_MS, FAST_PROBE_TIMEOUT_MS, SESSION_HEARTBEAT_INTERVAL_MS, HEARTBEAT_GOODBYE_MAX_MS } from "../config.js";
 
 const logger = createLogger("tunnel");
 
@@ -33,6 +33,7 @@ export async function updateTunnelUrl(selectedKey, tunnelUrl) {
   urlSyncCtx = ctx;
   const lanIp = getLanIp();
 
+  if (!REMOTE_CONFIGURED) return;
   retryForever({
     config: RETRY_CONFIG.urlSync,
     label: `urlSync ${tunnelUrl}`,

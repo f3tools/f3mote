@@ -4,7 +4,7 @@ Deploy your own private f3mote signaling and web infrastructure on Cloudflare Wo
 
 ## Why Self-Host?
 
-By default, f3mote provides free hosted signaling at `https://9remote.cc`. While all data is encrypted and traffic flows peer-to-peer over WebRTC, self-hosting gives you:
+By default, f3mote provides free hosted signaling at `https://relay.example.com`. While all data is encrypted and traffic flows peer-to-peer over WebRTC, self-hosting gives you:
 
 - **100% Data Sovereignty:** Device approval records, session tokens, and connection metadata live exclusively in your own Cloudflare D1 database.
 - **Custom Branding & Domains:** Host the web app on your own company domain (e.g. `remote.yourcompany.com`).

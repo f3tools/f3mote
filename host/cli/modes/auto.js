@@ -19,7 +19,7 @@ import { ensureKeyData, getVersion } from "../session/key.js";
 import { showConnectionInfo } from "../session/display.js";
 import { showBanner } from "../utils/tui.js";
 import { maskApiKey } from "../utils/apiKey.js";
-import { WORKER_URL, DELAYS, POLL } from "../config.js";
+import { WORKER_URL, REMOTE_CONFIGURED, DELAYS, POLL } from "../config.js";
 
 async function startServerAndTunnel(selectedKey) {
   logger.info("Starting server...");
@@ -31,7 +31,7 @@ async function startServerAndTunnel(selectedKey) {
   // Worker first: a crash while remote was on leaves agentOnline=1, and login
   // would keep handing out this key through the whole grace window.
   const remoteDisabled = loadSettings().remoteEnabled === false;
-  let remoteOnline = !remoteDisabled;
+  let remoteOnline = !remoteDisabled && REMOTE_CONFIGURED;
   if (remoteDisabled) await markRemoteOffline(selectedKey);
   if (remoteOnline) try {
     const res = await browserFetch(`${WORKER_URL}/api/session/create`, {

@@ -184,7 +184,7 @@ export default {
     failedRenameSession: "Oturum yeniden adlandırılamadı: {error}"
   },
   sessions: {
-    headerTitle: "9remote.cc",
+    headerTitle: "relay.example.com",
     connected: "Bağlı",
     disconnected: "Bağlantı kesildi",
     codespaceStopped: "Codespace durduruldu",

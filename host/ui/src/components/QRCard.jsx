@@ -3,7 +3,7 @@ import QRCode from "qrcode";
 import ConfirmPopup from "./ConfirmPopup";
 import { useI18n } from "../i18n";
 
-const ENDPOINT = "9remote.cc";
+const ENDPOINT = "relay.example.com";
 // Release a stuck spinner if the request fails (the value never changes then).
 const BUSY_TIMEOUT_MS = 15000;
 

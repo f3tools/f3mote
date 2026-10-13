@@ -8,8 +8,8 @@ const buffer = [];
 const listeners = new Set();
 
 const isBrowser = typeof window !== "undefined";
-// Auto-enable on dev subdomain (dev.9remote.cc) or explicit opt-in. Production
-// (9remote.cc) and host workspace are off by default — zero overhead, no buffer growth.
+// Auto-enable on dev subdomain (dev.relay.example.com) or explicit opt-in. Production
+// (relay.example.com) and host workspace are off by default — zero overhead, no buffer growth.
 const enabled = isBrowser && (
   (location.hostname.startsWith("dev.") || (location.hostname === "localhost" && !isHostEnvironment())) ||
   localStorage.getItem("f3mote:termLog") === "1"

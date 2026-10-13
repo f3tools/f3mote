@@ -83,7 +83,7 @@ Common issues and solutions when setting up and using f3mote.
 
 **Behavior & Solution:**
 - f3mote uses a persistent background PTY daemon (`ptyDaemon`). When your browser or mobile connection drops, your running processes (Docker builds, servers, Vim, tests) **do not die**.
-- Simply refresh or reopen `https://9remote.cc` and tap into your terminal session; it will reattach immediately to the running shell.
+- Simply refresh or reopen `https://relay.example.com` and tap into your terminal session; it will reattach immediately to the running shell.
 
 ---
 

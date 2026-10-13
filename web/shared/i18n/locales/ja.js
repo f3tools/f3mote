@@ -184,7 +184,7 @@ export default {
     failedRenameSession: "セッションの名前変更に失敗しました: {error}"
   },
   sessions: {
-    headerTitle: "9remote.cc",
+    headerTitle: "relay.example.com",
     connected: "接続済み",
     disconnected: "切断",
     codespaceStopped: "Codespace 停止中",

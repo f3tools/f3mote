@@ -53,8 +53,8 @@ export const viewport = {
 // Inline script - apply theme class before paint to prevent FOUC
 const themeInitScript = `(function(){try{var t=localStorage.getItem("${STORAGE_KEY}")||"${DEFAULT_THEME}";document.documentElement.classList.add(t);}catch(e){document.documentElement.classList.add("${DEFAULT_THEME}");}})();`;
 
-// Redirect Expo WebView from dev.9remote.cc to production 9remote.cc
-const expoRedirectScript = `(function(){try{if(location.hostname==="dev.9remote.cc"&&(window.ReactNativeWebView||/f3mote-Mobile/i.test(navigator.userAgent))){location.replace("https://9remote.cc"+location.pathname+location.search+location.hash);}}catch(e){}})();`;
+// Redirect Expo WebView from dev.relay.example.com to production relay.example.com
+const expoRedirectScript = `(function(){try{if(location.hostname==="dev.relay.example.com"&&(window.ReactNativeWebView||/f3mote-Mobile/i.test(navigator.userAgent))){location.replace("https://relay.example.com"+location.pathname+location.search+location.hash);}}catch(e){}})();`;
 
 // Native shell bridge — expo injects the real status-bar/notch insets via
 // handleSafeAreaInset; web applies them as --pl-* (0 when unset, so browsers/PWA

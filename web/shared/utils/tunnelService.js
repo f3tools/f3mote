@@ -1,7 +1,7 @@
-// Named tunnels (t-<shortId>.9remote.cc) are gone — the host runs a quick
+// Named tunnels (t-<shortId>.relay.example.com) are gone — the host runs a quick
 // tunnel and pushes its URL through session/update. What remains here tears
 // down the named tunnels still sitting on the account from that era.
-const TUNNEL_DOMAIN = "9remote.cc";
+const TUNNEL_DOMAIN = "relay.example.com";
 const ZONE_ID = "34ed092484851b44d0ede479b0288738";
 
 /**

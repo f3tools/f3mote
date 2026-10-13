@@ -184,7 +184,7 @@ export default {
     failedRenameSession: "Sessie hernoemen mislukt: {error}"
   },
   sessions: {
-    headerTitle: "9remote.cc",
+    headerTitle: "relay.example.com",
     connected: "Verbonden",
     disconnected: "Verbinding verbroken",
     codespaceStopped: "Codespace gestopt",

@@ -14,7 +14,7 @@ const PRODUCT_LINKS = [
 const RESOURCE_LINKS = [
   { href: "https://github.com/f3tools/f3mote", label: "GitHub" },
   { href: "https://www.npmjs.com/package/f3mote", label: "NPM" },
-  { href: "https://docs.9remote.cc/", label: "Documentation" },
+  { href: "https://docs.relay.example.com/", label: "Documentation" },
   { href: "https://www.facebook.com/groups/9teamvn", label: "Community" }
 ];
 

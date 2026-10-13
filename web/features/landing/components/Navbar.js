@@ -10,7 +10,7 @@ const LINKS = [
   { href: "#features", label: "Features" },
   { href: "#security", label: "Security" },
   { href: "#how-it-works", label: "How It Works" },
-  { href: "https://docs.9remote.cc/", label: "Docs", external: true },
+  { href: "https://docs.relay.example.com/", label: "Docs", external: true },
   { href: "https://github.com/f3tools/f3mote", label: "GitHub", external: true }
 ];
 

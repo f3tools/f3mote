@@ -886,7 +886,7 @@ export default function AgentDashboardView() {
               <ConnectCard icon={<AppleIcon />} iconClass="ad-tile-apple" title="iPhone & iPad" sub="App Store" href={APP_STORE_URL} />
               <ConnectCard icon={<PlayIcon />} iconClass="ad-tile-play" title="Android" sub="Google Play" href={PLAY_STORE_URL} />
               <ConnectCard icon="computer" iconClass="ad-tile-pc" title="PC & Mac" sub="All downloads" href={DOWNLOADS_URL} />
-              <ConnectCard icon="language" iconClass="ad-tile-web" title="Web" sub="9remote.cc" href={LOGIN_URL} />
+              <ConnectCard icon="language" iconClass="ad-tile-web" title="Web" sub="relay.example.com" href={LOGIN_URL} />
             </div>
           </Section>
 

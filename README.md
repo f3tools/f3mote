@@ -51,7 +51,7 @@ Scan the QR code from a phone (or open the URL) and you're on your machine's she
 | **macOS** | ✅ | ✅ | [Download .dmg](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-macos-universal.dmg) or `npm i -g f3mote` |
 | **Windows** | ✅ | ✅ | [Download .exe](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-windows-x64-setup.exe) or `npm i -g f3mote` |
 | **Linux** | ✅ | ✅ | [Download .deb / .AppImage](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-linux-amd64.deb) or `npm i -g f3mote` |
-| **Web Browser** | — | ✅ | [`https://9remote.cc/login`](https://9remote.cc/login) *(Zero install, any browser)* |
+| **Web Browser** | — | ✅ | [`https://relay.example.com/login`](https://relay.example.com/login) *(Zero install, any browser)* |
 | **iOS / iPadOS** | — | ✅ | [App Store](https://apps.apple.com/us/app/9remote/id6796664210) / Web PWA *(Supports iPad keyboard & trackpad)* |
 | **Android** | — | ✅ | [Google Play](https://play.google.com/store/apps/details?id=cc.remote9.app&pli=1) / Web PWA *(Fullscreen dev mode)* |
 

@@ -184,7 +184,7 @@ export default {
     failedRenameSession: "فشل إعادة تسمية الجلسة: {error}"
   },
   sessions: {
-    headerTitle: "9remote.cc",
+    headerTitle: "relay.example.com",
     connected: "متصل",
     disconnected: "غير متصل",
     codespaceStopped: "تم إيقاف Codespace",

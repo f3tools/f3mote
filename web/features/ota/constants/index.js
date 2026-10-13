@@ -9,9 +9,9 @@ const OTA_API = {
 };
 
 // R2 public base url used to build asset urls inside the manifest.
-// The bucket itself is served from a subdomain (e.g. r2.9remote.cc), not read
+// The bucket itself is served from a subdomain (e.g. r2.relay.example.com), not read
 // through the Worker — only the manifest is computed here.
-export const R2_DEFAULT_BASE = "https://r2.9remote.cc";
+export const R2_DEFAULT_BASE = "https://r2.relay.example.com";
 
 // SFV signature algorithm the client expects (matches expo-updates defaults)
 export const SIGN_ALG = "rsa-v1_5-sha256";

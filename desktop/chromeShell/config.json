@@ -1,7 +1,7 @@
 {
   "appName": "f3mote Web",
   "bundleId": "cc.f3mote.chromeshell",
-  "url": "https://dev.9remote.cc",
+  "url": "https://dev.relay.example.com",
   "profileDir": "f3moteWeb",
   "windowSize": "1280,840",
   "browsers": [

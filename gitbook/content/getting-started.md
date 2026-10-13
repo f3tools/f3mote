@@ -51,7 +51,7 @@ Starts the server with a local web dashboard available at `http://localhost:2208
 When f3mote starts, it sets up a secure Cloudflare tunnel and generates:
 1. **A QR Code** displayed in your terminal
 2. **A Permanent Access Key**
-3. **A Web App URL**: `https://9remote.cc/login`
+3. **A Web App URL**: `https://relay.example.com/login`
 
 ### Option 1: Scan QR Code (Fastest)
 1. Open your phone camera or QR scanner.
@@ -59,7 +59,7 @@ When f3mote starts, it sets up a secure Cloudflare tunnel and generates:
 3. The f3mote web app opens with your access key prefilled.
 
 ### Option 2: Manual Key Entry
-1. Visit `https://9remote.cc/login`.
+1. Visit `https://relay.example.com/login`.
 2. Enter the permanent key shown in your terminal.
 3. Tap **Connect**.
 

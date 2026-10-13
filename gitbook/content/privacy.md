@@ -59,4 +59,4 @@ We will post any update to this page and revise the date above.
 
 ## Contact
 
-privacy@9remote.cc
+privacy@relay.example.com

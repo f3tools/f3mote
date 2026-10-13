@@ -184,7 +184,7 @@ export default {
     failedRenameSession: "Gagal mengganti nama sesi: {error}"
   },
   sessions: {
-    headerTitle: "9remote.cc",
+    headerTitle: "relay.example.com",
     connected: "Terhubung",
     disconnected: "Terputus",
     codespaceStopped: "Codespace dihentikan",

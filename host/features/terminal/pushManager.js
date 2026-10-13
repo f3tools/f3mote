@@ -37,7 +37,7 @@ function initVapidKeys() {
     keys = { publicKey: generated.publicKey, privateKey: generated.privateKey };
     saveVapidKeys(keys);
   }
-  webpush.setVapidDetails("mailto:admin@9remote.cc", keys.publicKey, keys.privateKey);
+  webpush.setVapidDetails("mailto:admin@relay.example.com", keys.publicKey, keys.privateKey);
   return keys;
 }
 

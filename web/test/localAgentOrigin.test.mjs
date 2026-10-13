@@ -46,7 +46,7 @@ test("agent-served page on 127.0.0.1 also keeps its own origin", () => {
 // A remote page must keep its own origin — the tunnel is its carrier, and
 // 127.0.0.1 there is the viewer's own machine, not the agent.
 test("a remote page is left alone", () => {
-  at("https://dev.9remote.cc/workspace/");
+  at("https://dev.relay.example.com/workspace/");
   assert.equal(agentOriginFrom(payload), null);
 });
 
@@ -79,14 +79,14 @@ test("isSameMachine returns true on 127.0.0.1 agent port", () => {
 });
 
 test("isSameMachine returns true in Tauri desktop app even on custom domain", () => {
-  at("https://app.9remote.cc/workspace");
+  at("https://app.relay.example.com/workspace");
   global.window.__TAURI__ = {};
   assert.equal(isSameMachine(), true);
   delete global.window.__TAURI__;
 });
 
 test("isSameMachine returns false on remote origin", () => {
-  at("https://dev.9remote.cc/workspace");
+  at("https://dev.relay.example.com/workspace");
   assert.equal(isSameMachine(), false);
 });
 
@@ -101,7 +101,7 @@ test("isHostEnvironment returns true on 127.0.0.1 agent port", () => {
 });
 
 test("isHostEnvironment returns false on remote origin", () => {
-  at("https://dev.9remote.cc/workspace");
+  at("https://dev.relay.example.com/workspace");
   assert.equal(isHostEnvironment(), false);
 });
 

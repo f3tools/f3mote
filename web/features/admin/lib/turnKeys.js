@@ -7,7 +7,7 @@
 
 export const TURN_SCOPES = ["dev", "prod", "both"];
 
-// Hosts that count as the dev environment. The prod worker allows dev.9remote.cc
+// Hosts that count as the dev environment. The prod worker allows dev.relay.example.com
 // too (its ALLOWED_ORIGINS covers both zones), so the origin list cannot decide
 // this — the hostname is the only thing that actually differs.
 // hostname is used instead of host so a port is never part of the comparison;

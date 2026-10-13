@@ -3,7 +3,7 @@ import { createPortal } from "preact/compat";
 import { useI18n } from "../i18n";
 import { SUPPORTED_LOCALES } from "../i18n/config";
 
-const HELP_URL = "https://docs.9remote.cc/";
+const HELP_URL = "https://docs.relay.example.com/";
 
 /** Reusable toggle inside settings */
 function Toggle({ on, onClick, disabled, title }) {

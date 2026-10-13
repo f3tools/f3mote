@@ -74,8 +74,8 @@ test("a public route echoes the caller's origin, never a wildcard", () => {
   // Tunnel routes are called cross-origin by the web app, so they need CORS —
   // but "*" let any page read them. The web app's own origin varies per deploy,
   // so the header echoes what asked rather than naming one.
-  assert.equal(corsOriginFor("https://9remote.cc", true), "https://9remote.cc");
-  assert.equal(corsOriginFor("https://dev.9remote.cc", true), "https://dev.9remote.cc");
+  assert.equal(corsOriginFor("https://relay.example.com", true), "https://relay.example.com");
+  assert.equal(corsOriginFor("https://dev.relay.example.com", true), "https://dev.relay.example.com");
 });
 
 test("a private route grants CORS only to the local UI", () => {

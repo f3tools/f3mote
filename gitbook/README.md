@@ -1,6 +1,6 @@
 # f3mote Documentation
 
-Deploy to Cloudflare Pages: https://docs.9remote.cc
+Deploy to Cloudflare Pages: https://docs.relay.example.com
 
 ## Local Development
 
@@ -55,12 +55,12 @@ npx wrangler pages deploy out --project-name=f3mote-docs
 
 1. Go to Cloudflare Dashboard
 2. Pages → f3mote-docs → Custom domains
-3. Add: `docs.9remote.cc`
+3. Add: `docs.relay.example.com`
 4. DNS will be configured automatically
 
 ## Environment
 
-- **Production**: https://docs.9remote.cc
+- **Production**: https://docs.relay.example.com
 - **Preview**: https://f3mote-docs.pages.dev
 
 ## Structure

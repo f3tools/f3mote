@@ -2,7 +2,7 @@ export const DOCS_CONFIG = {
   title: "f3mote Documentation",
   description: "Access your terminal, desktop, and files from anywhere",
   logo: "f3mote",
-  appUrl: "https://9remote.cc",
+  appUrl: "https://relay.example.com",
   githubUrl: "https://github.com/yourusername/f3mote",
 
   navigation: [

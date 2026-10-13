@@ -6,12 +6,12 @@
 //
 // Usage:
 //   node web/test/signaling-do-e2e.test.mjs <baseUrl> <apiKey>
-//   node web/test/signaling-do-e2e.test.mjs wss://dev.9remote.cc/signaling <apiKey>
+//   node web/test/signaling-do-e2e.test.mjs wss://dev.relay.example.com/signaling <apiKey>
 //
 // The apiKey must have a live session row (Worker gates on it). Create one first
 // via POST /api/connect, or just use the key you'd connect the app with.
 
-const BASE = process.argv[2] || "wss://dev.9remote.cc/signaling";
+const BASE = process.argv[2] || "wss://dev.relay.example.com/signaling";
 const APIKEY = process.argv[3] || "";
 const ROOM = "e2e-" + Math.random().toString(36).slice(2, 10);
 

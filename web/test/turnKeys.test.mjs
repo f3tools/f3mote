@@ -14,12 +14,12 @@ const test = (name, fn) => {
 
 
 test("dev-prefixed host → dev scope", () => {
-  assert.equal(scopeForOrigin("https://dev.9remote.cc"), "dev");
-  assert.equal(scopeForOrigin("https://dev.9remote.cc:443"), "dev");
+  assert.equal(scopeForOrigin("https://dev.relay.example.com"), "dev");
+  assert.equal(scopeForOrigin("https://dev.relay.example.com:443"), "dev");
 });
 test("prod host → prod scope", () => {
-  assert.equal(scopeForOrigin("https://9remote.cc"), "prod");
-  assert.equal(scopeForOrigin("https://sites.9remote.cc"), "prod");
+  assert.equal(scopeForOrigin("https://relay.example.com"), "prod");
+  assert.equal(scopeForOrigin("https://sites.relay.example.com"), "prod");
 });
 test("localhost dev server → dev scope", () => {
   assert.equal(scopeForOrigin("http://localhost:3000"), "dev");

@@ -24,7 +24,7 @@ import { waitForTunnelReady } from "../tunnel/readiness.js";
 import { updateTunnelUrl, markRemoteOffline, startSessionHeartbeat } from "../tunnel/urlSync.js";
 import { ensureKeyData } from "../session/key.js";
 import { buildMenuHeader } from "../session/display.js";
-import { WORKER_URL, DELAYS, TUI, POLL } from "../config.js";
+import { WORKER_URL, REMOTE_CONFIGURED, DELAYS, TUI, POLL } from "../config.js";
 
 let activeSubmenuRefresh = null;
 
@@ -68,7 +68,7 @@ export async function tuiMode() {
   // Worker first: a crash while remote was on leaves agentOnline=1, and login
   // would keep handing out this key through the whole grace window.
   const remoteDisabled = loadSettings().remoteEnabled === false;
-  let remoteOnline = !remoteDisabled;
+  let remoteOnline = !remoteDisabled && REMOTE_CONFIGURED;
   if (remoteDisabled) await markRemoteOffline(keyData.key);
   if (remoteOnline) try {
     const res = await browserFetch(`${WORKER_URL}/api/session/create`, {

@@ -44,7 +44,7 @@ const nextConfig = {
     "172.16.*.*"
   ],
   env: {
-    NEXT_PUBLIC_WORKER_URL: process.env.NEXT_PUBLIC_WORKER_URL || "https://9remote.cc",
+    NEXT_PUBLIC_WORKER_URL: process.env.NEXT_PUBLIC_WORKER_URL || "https://relay.example.com",
     NEXT_PUBLIC_SERVER_VERSION: rootPkg.version,
     NEXT_PUBLIC_STATIC_EXPORT: process.env.STATIC_EXPORT || "0",
   },
@@ -108,7 +108,7 @@ const nextConfig = {
       [
         "connect-src 'self'",
         "https://*.trycloudflare.com wss://*.trycloudflare.com",
-        "https://*.9remote.cc wss://*.9remote.cc",
+        "https://*.relay.example.com wss://*.relay.example.com",
         "https://api.github.com",
         // 10.0.0.0/8
         "http://10.* ws://10.*",
@@ -121,7 +121,7 @@ const nextConfig = {
       ].join(" "),
       // PDFs and HTML previews render from blob: URLs; the sites host holds the
       // browsed local servers, framed by the site browser.
-      "frame-src 'self' blob: https://*.9remote.cc http://sites.localhost:3000",
+      "frame-src 'self' blob: https://*.relay.example.com http://sites.localhost:3000",
       "worker-src 'self' blob:",
       "object-src 'none'",
       "base-uri 'self'",

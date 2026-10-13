@@ -184,7 +184,7 @@ export default {
     failedRenameSession: "सत्र का नाम बदलने में विफल: {error}"
   },
   sessions: {
-    headerTitle: "9remote.cc",
+    headerTitle: "relay.example.com",
     connected: "कनेक्ट किया गया",
     disconnected: "डिस्कनेक्ट किया गया",
     codespaceStopped: "Codespace बंद हो गया",
