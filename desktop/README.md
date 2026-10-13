@@ -25,7 +25,7 @@ Required so users can open the `.app` / `.dmg` without Gatekeeper warnings. Need
 
 ### 2. Register the Bundle ID
 
-Bundle ID is `cc.9remote.desktop` (already set in `desktop/package.json` → `build.appId`). No explicit App ID needed for Developer ID signing outside App Store, but ensure no conflicts.
+Bundle ID is `cc.f3mote.desktop` (already set in `desktop/package.json` → `build.appId`). No explicit App ID needed for Developer ID signing outside App Store, but ensure no conflicts.
 
 ### 3. Create an App-Specific Password (for notarization)
 

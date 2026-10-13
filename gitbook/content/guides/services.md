@@ -64,7 +64,7 @@ f3mote key
 On macOS, running f3mote as a user `LaunchAgent` allows it to start automatically when you log into your Mac and maintain access to screen recording and terminal permissions.
 
 ### Step 1: Create the Plist File
-Create `~/Library/LaunchAgents/cc.9remote.agent.plist`:
+Create `~/Library/LaunchAgents/cc.f3mote.agent.plist`:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -72,7 +72,7 @@ Create `~/Library/LaunchAgents/cc.9remote.agent.plist`:
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>cc.9remote.agent</string>
+    <string>cc.f3mote.agent</string>
     <key>ProgramArguments</key>
     <array>
         <string>/bin/sh</string>
@@ -93,12 +93,12 @@ Create `~/Library/LaunchAgents/cc.9remote.agent.plist`:
 
 ### Step 2: Load the Service
 ```bash
-launchctl load ~/Library/LaunchAgents/cc.9remote.agent.plist
+launchctl load ~/Library/LaunchAgents/cc.f3mote.agent.plist
 ```
 
 To stop or unload:
 ```bash
-launchctl unload ~/Library/LaunchAgents/cc.9remote.agent.plist
+launchctl unload ~/Library/LaunchAgents/cc.f3mote.agent.plist
 ```
 
 ---

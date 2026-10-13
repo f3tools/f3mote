@@ -2,7 +2,7 @@
   "productName": "f3mote",
   "mainBinaryName": "f3mote",
   "version": "3.0.40",
-  "identifier": "cc.9remote.desktop",
+  "identifier": "cc.f3mote.desktop",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:5173"

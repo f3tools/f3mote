@@ -15,7 +15,7 @@ import { PATHS as APP_PATHS, PACKAGE_NAME } from "../../lib/constants.js";
 
 const AUTOSTART_LOG = join(APP_PATHS.LOGS, "autostart.log");
 
-const APP_ID = "cc.9remote.agent";
+const APP_ID = "cc.f3mote.agent";
 const APP_NAME = "f3mote";
 const AUTOSTART_ARGS = ["--tray", "--skip-update", "--start"];
 
