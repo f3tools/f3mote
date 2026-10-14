@@ -47,7 +47,7 @@ jobs:
           git add package.json host/package.json desktop/package.json desktop/src-tauri/tauri.conf.json desktop/src-tauri/Cargo.toml
           git commit -m "Release f3mote $VERSION"
           git tag "host-v$VERSION"
-          git push origin HEAD:main --follow-tags
+          git push origin HEAD:main "refs/tags/host-v$VERSION"
 
       - name: Check tag matches package version
         if: startsWith(github.ref, 'refs/tags/host-v')
