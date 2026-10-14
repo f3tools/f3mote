@@ -1,11 +1,11 @@
 <div align="center">
-  <img src="https://raw.githubusercontent.com/f3tools/f3mote/main/web/public/screenshots/desktop-ide.webp" alt="f3mote desktop workspace: terminal, editor and AI agent panes side by side" width="880"/>
+  <img src="https://raw.githubusercontent.com/f3tools/f3mote/main/web/public/screenshots/desktop-ide.webp" alt="f3mote desktop workspace: three Claude Code terminal panes side by side" width="880"/>
 
   <table align="center">
     <tr>
       <td><img src="https://raw.githubusercontent.com/f3tools/f3mote/main/web/public/screenshots/mobile-1.webp" width="230" alt="Claude Code on Phone"/></td>
-      <td><img src="https://raw.githubusercontent.com/f3tools/f3mote/main/web/public/screenshots/mobile-2.webp" width="230" alt="File Explorer on Phone"/></td>
-      <td><img src="https://raw.githubusercontent.com/f3tools/f3mote/main/web/public/screenshots/mobile-3.webp" width="230" alt="System Dashboard on Phone"/></td>
+      <td><img src="https://raw.githubusercontent.com/f3tools/f3mote/main/web/public/screenshots/mobile-2.webp" width="230" alt="Claude Code session on Phone"/></td>
+      <td><img src="https://raw.githubusercontent.com/f3tools/f3mote/main/web/public/screenshots/mobile-3.webp" width="230" alt="Idle terminal on Phone"/></td>
     </tr>
   </table>
 

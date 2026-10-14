@@ -39,8 +39,8 @@ const SUPERPOWERS = [
 
 const PHONES = [
   { src: "/screenshots/mobile-1.webp", alt: "Claude Code running in f3mote on a phone" },
-  { src: "/screenshots/mobile-2.webp", alt: "File explorer in f3mote on a phone" },
-  { src: "/screenshots/mobile-3.webp", alt: "System dashboard in f3mote on a phone" }
+  { src: "/screenshots/mobile-2.webp", alt: "Claude Code session in f3mote on a phone" },
+  { src: "/screenshots/mobile-3.webp", alt: "Idle terminal in f3mote on a phone" }
 ];
 
 export default function HeroSection() {
@@ -83,7 +83,7 @@ export default function HeroSection() {
             </div>
 
             <p className="font-mono text-xs sm:text-sm mb-3 max-w-xl mx-auto lg:mx-0" style={{ color: THEME.accent }}>
-              Codex CLI looks like 1995? Claude Code's TUI hurts? Forget them. Same agents, one UI you'll actually love.
+              Codex CLI looks like 1995? Claude Code&apos;s TUI hurts? Forget them. Same agents, one UI you&apos;ll actually love.
             </p>
 
             <p
@@ -135,7 +135,7 @@ export default function HeroSection() {
                 </div>
                 <img
                   src="/screenshots/desktop-ide.webp"
-                  alt="f3mote desktop workspace: terminal, editor and AI agent panes side by side"
+                  alt="f3mote desktop workspace: three Claude Code terminal panes side by side"
                   className="w-full block"
                 />
               </div>
