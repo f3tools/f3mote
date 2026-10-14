@@ -54,9 +54,9 @@ f3mote
 
 | Platform | Host (Your Machine) | Client (Anywhere) | Download / Access |
 |---|:---:|:---:|---|
-| **macOS** | ✅ | ✅ | `npm i -g f3mote` or [Download .dmg](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-macos-universal.dmg) |
-| **Windows** | ✅ | ✅ | `npm i -g f3mote` or [Download .exe](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-windows-x64-setup.exe) |
-| **Linux** | ✅ | ✅ | `npm i -g f3mote` or [Download .deb / .AppImage](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-linux-amd64.deb) |
+| **macOS** | ✅ | ✅ | `npm i -g f3mote` (desktop app coming soon) |
+| **Windows** | ✅ | ✅ | `npm i -g f3mote` (desktop app coming soon) |
+| **Linux** | ✅ | ✅ | `npm i -g f3mote` (desktop app coming soon) |
 | **Web Browser** | — | ✅ | [`https://relay.example.com/login`](https://relay.example.com/login) *(Zero install, any browser)* |
 | **iOS / iPadOS** | — | ✅ | Web / PWA (Add to Home Screen) *(Supports iPad keyboard & trackpad)* |
 | **Android** | — | ✅ | Web / PWA (Add to Home Screen) *(Fullscreen dev mode)* |

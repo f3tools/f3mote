@@ -36,7 +36,7 @@ respond = () => Promise.resolve({ ok: true, json: () => Promise.resolve([release
 loadDesktopReleases();
 await tick();
 assert.equal(calls, 1, "one fetch");
-assert.match(lastUrl, /api\.github\.com\/repos\/decolua\/f3mote\/releases/, "reads the public releases API");
+assert.match(lastUrl, /api\.github\.com\/repos\/f3tools\/f3mote\/releases/, "reads the public releases API");
 assert.deepEqual(cached(), [{ tag: "v9.9.9", date: "2026-01-02" }], "tag + day cached, nothing else");
 
 // ── the filter is what keeps archives and partials out ──────────────────────

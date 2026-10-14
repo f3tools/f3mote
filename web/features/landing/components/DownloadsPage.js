@@ -7,7 +7,7 @@ import Footer from "./Footer";
 import { useDesktopReleases } from "../hooks/useDesktopReleases";
 import {
   THEME, INSTALLERS, DESKTOP_RELEASES, downloadUrl, detectOs, byNewest,
-  GITHUB_REPO_URL, APP_STORE_URL, PLAY_STORE_URL, LATEST_BUILD
+  GITHUB_REPO_URL, APP_STORE_URL, PLAY_STORE_URL, LATEST_BUILD, DESKTOP_RELEASED
 } from "../constants/landingConfig";
 
 // Server + first paint use "other" so hydration matches; the real OS swaps in after mount
@@ -75,6 +75,22 @@ export default function DownloadsPage() {
   const releases = byNewest(live || DESKTOP_RELEASES);
   // Cards already carry the newest build; the list starts one below it
   const older = releases.slice(1);
+
+  if (!DESKTOP_RELEASED) {
+    return (
+      <div className="min-h-screen overflow-x-hidden safe-area-insets" style={{ color: THEME.text }}>
+        <AnimatedBackground />
+        <div className="landing-light" aria-hidden />
+        <Navbar />
+        <main className="relative z-10 pt-28 pb-24 px-4 sm:px-6 lg:px-8 text-center">
+          <h1 className="text-3xl sm:text-4xl font-bold mb-3" style={{ color: THEME.text }}>Desktop app coming soon</h1>
+          <p className="text-base sm:text-lg max-w-xl mx-auto" style={{ color: THEME.textDim }}>
+            The host app is not released yet. Install the CLI now with <code>npm i -g f3mote</code>.
+          </p>
+        </main>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen overflow-x-hidden safe-area-insets" style={{ color: THEME.text }}>

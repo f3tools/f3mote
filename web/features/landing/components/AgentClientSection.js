@@ -2,7 +2,7 @@
 
 import { Fragment, useState, useSyncExternalStore } from "react";
 import Link from "next/link";
-import { THEME, HALVES, detectOs, DOWNLOADS_PATH, LATEST_BUILD, versionOf, APP_STORE_URL, PLAY_STORE_URL } from "../constants/landingConfig";
+import { THEME, HALVES, detectOs, DOWNLOADS_PATH, DESKTOP_RELEASED, LATEST_BUILD, versionOf, APP_STORE_URL, PLAY_STORE_URL } from "../constants/landingConfig";
 
 // Mirror-tabbed cards — both halves get the same segmented control + body row
 const HALF_TABS = {
@@ -180,10 +180,12 @@ export default function AgentClientSection() {
                               <svg className="w-4 h-4 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 3v12m0 0l-4-4m4 4l4-4M4 21h16" />
                               </svg>
-                              {OS_LABEL[os] && activeTab !== "desktop"
-                                ? `Download v${desktopVersion} for ${OS_LABEL[os]}`
-                                : `Download v${desktopVersion}`}
-                              {INSTALLER_EXT[os] && <span className="ml-auto text-xs font-mono opacity-70">{INSTALLER_EXT[os]}</span>}
+                              {!DESKTOP_RELEASED
+                                ? "Desktop app coming soon"
+                                : OS_LABEL[os] && activeTab !== "desktop"
+                                  ? `Download v${desktopVersion} for ${OS_LABEL[os]}`
+                                  : `Download v${desktopVersion}`}
+                              {DESKTOP_RELEASED && INSTALLER_EXT[os] && <span className="ml-auto text-xs font-mono opacity-70">{INSTALLER_EXT[os]}</span>}
                             </>
                           )}
                         </Link>

@@ -28,12 +28,10 @@ npm i -g f3mote
 f3mote
 ```
 
-### 2. Or Download Desktop App
+### 2. Desktop App (coming soon)
 
-- **macOS (Universal DMG):** [f3mote-macos-universal.dmg](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-macos-universal.dmg) *(Intel + Apple Silicon, signed & notarized)*
-- **Windows (Setup EXE):** [f3mote-windows-x64-setup.exe](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-windows-x64-setup.exe) *(Installer, x64)*
-- **Windows (Portable EXE):** [f3mote-windows-x64-portable.exe](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-windows-x64-portable.exe) *(Portable, no install)*
-- **Linux:** [deb x64](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-linux-amd64.deb) · [deb arm64](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-linux-arm64.deb) · [AppImage arm64](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-linux-arm64.AppImage)
+The desktop app is not released yet. Use the CLI above for now.
+
 
 ### 3. Or Get Mobile App
 
@@ -48,9 +46,9 @@ Scan the QR code from a phone (or open the URL) and you're on your machine's she
 
 | Platform | Host (Your Machine) | Client (Anywhere) | Download / Access |
 |---|:---:|:---:|---|
-| **macOS** | ✅ | ✅ | [Download .dmg](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-macos-universal.dmg) or `npm i -g f3mote` |
-| **Windows** | ✅ | ✅ | [Download .exe](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-windows-x64-setup.exe) or `npm i -g f3mote` |
-| **Linux** | ✅ | ✅ | [Download .deb / .AppImage](https://github.com/f3tools/f3mote/releases/latest/download/f3mote-linux-amd64.deb) or `npm i -g f3mote` |
+| **macOS** | ✅ | ✅ | `npm i -g f3mote` (desktop app coming soon) |
+| **Windows** | ✅ | ✅ | `npm i -g f3mote` (desktop app coming soon) |
+| **Linux** | ✅ | ✅ | `npm i -g f3mote` (desktop app coming soon) |
 | **Web Browser** | — | ✅ | [`https://relay.example.com/login`](https://relay.example.com/login) *(Zero install, any browser)* |
 | **iOS / iPadOS** | — | ✅ | [App Store](https://apps.apple.com/us/app/9remote/id6796664210) / Web PWA *(Supports iPad keyboard & trackpad)* |
 | **Android** | — | ✅ | [Google Play](https://play.google.com/store/apps/details?id=cc.remote9.app&pli=1) / Web PWA *(Fullscreen dev mode)* |

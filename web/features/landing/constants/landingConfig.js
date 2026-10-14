@@ -23,6 +23,9 @@ const REPO = "https://github.com/f3tools/f3mote";
 export const APP_STORE_URL = "https://apps.apple.com/us/app/9remote/id6796664210";
 export const PLAY_STORE_URL = "https://play.google.com/store/apps/details?id=cc.remote9.app&pli=1";
 export const DOWNLOADS_PATH = "/download";
+
+// Flip to true once a desktop build is published to GitHub Releases with the asset names below
+export const DESKTOP_RELEASED = false;
 export const GITHUB_REPO_URL = REPO;
 
 // Enough to pick an installer; iPadOS reports as Mac, which the .dmg does not serve

@@ -2,6 +2,8 @@
 
 Run f3mote as a native, zero-friction desktop application on macOS, Windows and Linux.
 
+> **Not released yet.** The desktop app is in development and no installers are published. Until it ships, install the CLI with `npm install -g f3mote` (see [Getting Started](getting-started)). The steps below describe the app as it will be installed.
+
 ## What It Does
 
 While the f3mote CLI runs in your terminal, the **f3mote Desktop App** wraps the host and web interface in a lightweight native wrapper built with **Tauri**. It lives quietly in your system tray, boots on startup, and eliminates the need to keep a terminal window open.
