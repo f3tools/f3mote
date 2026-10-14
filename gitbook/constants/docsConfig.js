@@ -41,6 +41,7 @@ export const DOCS_CONFIG = {
       items: [
         { title: "Background Services & Daemon", slug: "guides/services" },
         { title: "Advanced AI Workflow", slug: "guides/ai-workflow" },
+        { title: "Using the Workspace", slug: "guides/using-the-workspace" },
         { title: "Self-Hosting", slug: "guides/self-hosting" },
       ]
     },
