@@ -73,8 +73,13 @@ jobs:
           VERSION=$(node -p "require('./package.json').version")
           if npm view "f3mote@$VERSION" version >/dev/null 2>&1; then
             echo "f3mote@$VERSION is already published, skipping."
-          else
-            npm publish --access public
+          elif ! npm publish --access public 2>&1 | tee /tmp/publish.log; then
+            if grep -q "previously staged version" /tmp/publish.log; then
+              echo "f3mote@$VERSION is staged on npm and awaiting maintainer approval (2FA)."
+            else
+              cat /tmp/publish.log
+              exit 1
+            fi
           fi
 
       - name: Create GitHub release
